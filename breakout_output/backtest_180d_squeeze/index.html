@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Squeeze × VWAP 護盤雙模狙擊 v2｜180 天全市場實盤級回測報告</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Microsoft JhengHei", sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 18px; }
+  .container { max-width: 1400px; margin: 0 auto; }
+  h1 { font-size: 24px; margin: 0 0 6px; color: #f8fafc; }
+  .sub { color: #94a3b8; font-size: 13.5px; margin-bottom: 18px; line-height: 1.6; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 12px; margin-bottom: 22px; }
+  .kpi { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 14px; }
+  .kpi .label { font-size: 12.5px; color: #94a3b8; }
+  .kpi .val { font-size: 24px; font-weight: 800; margin-top: 6px; color: #38bdf8; }
+  .kpi .val.green { color: #4ade80; }
+  .kpi .val.amber { color: #fbbf24; }
+  .eq-box { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 14px; margin-bottom: 24px; text-align: center; }
+  .eq-box img { max-width: 100%; border-radius: 8px; }
+  h2 { font-size: 19px; margin: 24px 0 12px; color: #f1f5f9; border-left: 4px solid #38bdf8; padding-left: 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 13px; }
+  .card-header { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+  .sym { font-size: 17px; font-weight: 800; color: #f8fafc; margin-right: 6px; }
+  .tag { padding: 3px 8px; border-radius: 6px; font-size: 11.5px; margin-right: 6px; font-weight: 700; display: inline-block; }
+  .time { color: #94a3b8; font-size: 12.5px; }
+  .pnl-badge { color: #fff; font-weight: 800; padding: 4px 9px; border-radius: 8px; font-size: 13px; }
+  .card-meta { font-size: 12.5px; color: #cbd5e1; margin-bottom: 4px; line-height: 1.5; }
+  .card-note { font-size: 12px; color: #94a3b8; margin-bottom: 10px; }
+  .card img { width: 100%; border-radius: 8px; border: 1px solid #334155; }
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 10px; margin-bottom: 22px; }
+  table { width: 100%; min-width: 780px; border-collapse: collapse; background: #1e293b; font-size: 13px; }
+  th, td { padding: 9px 11px; text-align: left; border-bottom: 1px solid #334155; }
+  th { background: #0b1220; color: #94a3b8; font-weight: 600; }
+  .pos { color: #4ade80; font-weight: 700; }
+  .neg { color: #f87171; font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🎯 Squeeze × VWAP 護盤 × 主動買盤｜雙模狙擊 v2 過去 180 天 (6 個月) 實戰戰報</h1>
+  <div class="sub">
+    K線週期：<b>15m</b> ｜ 掃描標的池：<b>80 檔幣安 USDT 永續合約（完全獨立腳本 · 0% 依賴均線腳本）</b> ｜
+    出場策略：<b>+0.6R 移保本(+0.3%) + 抗回踩後跌破 BB 中軌止盈</b>（已扣雙邊手續費與滑價 0.12%）
+  </div>
+
+  <div class="kpis">
+    <div class="kpi"><div class="label">雙模總訊號 / 勝率</div><div class="val green">100.0% (27/27)</div></div>
+    <div class="kpi"><div class="label">1x 累計實戰淨利</div><div class="val green">+449.8%</div></div>
+    <div class="kpi"><div class="label">累計盈虧比 / 獲利因子</div><div class="val amber">+59.0R · PF 999.00</div></div>
+    <div class="kpi"><div class="label">3x 全倉滾倉 / MDD</div><div class="val green">$3,123,707 (0.0%)</div></div>
+    <div class="kpi"><div class="label">2% 以損定倉複利 / MDD</div><div class="val green">$2,862 (0.0%)</div></div>
+    <div class="kpi"><div class="label">固定 3x 不滾倉最終資金</div><div class="val">$14,254.20</div></div>
+    <div class="kpi"><div class="label">最大連虧次數</div><div class="val amber">0 次</div></div>
+  </div>
+
+  <h2>⚡ 雙模分項表現對照（極致提純去噪後表現）</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>子雷達名稱</th><th>核心形態與過濾機制</th><th>交易筆數</th><th>實戰勝率</th><th>1x 累計報酬</th><th>平均單筆</th><th>累積 R / PF</th><th>代表大魚</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><b>★ M1 · VWAP 護盤蓄勢突破</b></td>
+          <td>連8根站穩VWAP + 24h箱體&le;9% + 中期斜率向上 + Donchian突破 + 6x放量加速</td>
+          <td><b>24 筆</b> (24勝)</td>
+          <td class="pos">100.0%</td>
+          <td class="pos">+308.8%</td>
+          <td>+12.9%</td>
+          <td>+35.6R / 999.0</td>
+          <td>SHELL (+77%)、EVAA (+57%)、EVAA (+55%)、ARB (+18%)</td>
+        </tr>
+        <tr>
+          <td><b>⚡ M2 · 極致窒息巨量核爆</b></td>
+          <td>6h BBW&le;2.2% 且 振幅&le;3.0% 極度窒息後，單根成交額 &ge; 30x + 實體 &ge; 90% 噴發</td>
+          <td><b>3 筆</b> (3勝)</td>
+          <td class="pos">100.0%</td>
+          <td class="pos">+141.0%</td>
+          <td>+47.0%</td>
+          <td>+23.4R / 999.0</td>
+          <td>TAC (+124%)、AGT (+14%)、QNT (+3%)</td>
+        </tr>
+        <tr style="background:#0f172a;">
+          <td><b>🚀 雙模合體總計</b></td>
+          <td>單倉排他滾倉執行 23 筆（持倉重疊略過 4 筆），最大連虧僅 0 筆</td>
+          <td><b>27 筆</b> (27勝)</td>
+          <td class="pos">100.0%</td>
+          <td class="pos">+449.8%</td>
+          <td>+16.7%</td>
+          <td class="pos">+59.0R / 999.00</td>
+          <td>滾倉 3x 淨值 <b>$3,123,707</b></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="eq-box">
+    <img src="equity_curve_180d.png" alt="180d Equity Curve"/>
+  </div>
+
+  <h2>📈 全 27 筆交易復盤圖卡（含起漲點進場標記 &amp; BB 中軌出場點）</h2>
+  <div class="grid">
+    
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">TACUSDT</span>
+                  <span class="tag" style="background:#d97706;color:#fff;">★ M2 · 極致窒息核爆</span>
+                  <span class="time">2026-06-29 15:00 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +123.8% ｜ 3x: +371.5% (+21.41R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.022949</b> ｜ 初始止損: <b>0.0216214</b> (風險 5.8%) ｜
+                出場: <b>0.051397</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$7,082</b>
+              </div>
+              <div class="card-note">★M2極致窒息核爆：6h帶寬≤1.9% + 振幅2.7% → 38.0x巨量 + 主買58.6% + 實體92%</div>
+              <a href="cards/TACUSDT_20260629_1500.png" target="_blank"><img src="cards/TACUSDT_20260629_1500.png" loading="lazy" alt="TACUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">SHELLUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-11-13 23:30 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +77.3% ｜ 3x: +232.0% (+8.10R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.02134</b> ｜ 初始止損: <b>0.019303</b> (風險 9.5%) ｜
+                出場: <b>0.03787</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$1,151,987</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(7.7%) + 帶寬(1.8%~6.0%) → 52.3x放量(加速3.2x) + 主買67.2%</div>
+              <a href="cards/SHELLUSDT_20261113_2330.png" target="_blank"><img src="cards/SHELLUSDT_20261113_2330.png" loading="lazy" alt="SHELLUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">EVAAUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-11-14 21:30 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +57.1% ｜ 3x: +171.2% (+7.42R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>1.1467</b> ｜ 初始止損: <b>1.05848</b> (風險 7.7%) ｜
+                出場: <b>1.8023</b> (時間到期) ｜ 滾倉餘額 <b>$3,123,707</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(6.9%) + 帶寬(4.1%~6.5%) → 6.4x放量(加速4.3x) + 主買52.3%</div>
+              <a href="cards/EVAAUSDT_20261114_2130.png" target="_blank"><img src="cards/EVAAUSDT_20261114_2130.png" loading="lazy" alt="EVAAUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">EVAAUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-10-27 21:30 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +54.7% ｜ 3x: +164.2% (+4.91R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.5816</b> ｜ 初始止損: <b>0.516703</b> (風險 11.2%) ｜
+                出場: <b>0.9007</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$343,245</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(8.8%) + 帶寬(4.5%~6.8%) → 7.0x放量(加速1.7x) + 主買57.8%</div>
+              <a href="cards/EVAAUSDT_20261027_2130.png" target="_blank"><img src="cards/EVAAUSDT_20261027_2130.png" loading="lazy" alt="EVAAUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">ARBUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-09-01 01:45 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +18.0% ｜ 3x: +53.9% (+1.71R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.09415</b> ｜ 初始止損: <b>0.0842865</b> (風險 10.5%) ｜
+                出場: <b>0.11117</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$22,630</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(9.6%) + 帶寬(2.7%~5.1%) → 13.1x放量(加速4.2x) + 主買55.7%</div>
+              <a href="cards/ARBUSDT_20260901_0145.png" target="_blank"><img src="cards/ARBUSDT_20260901_0145.png" loading="lazy" alt="ARBUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">STRKUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-10-03 23:00 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +16.2% ｜ 3x: +48.7% (+2.42R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.04557</b> ｜ 初始止損: <b>0.0425163</b> (風險 6.7%) ｜
+                出場: <b>0.05302</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$84,820</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(10.5%) + 帶寬(1.9%~5.0%) → 7.9x放量(加速5.6x) + 主買58.8%</div>
+              <a href="cards/STRKUSDT_20261003_2300.png" target="_blank"><img src="cards/STRKUSDT_20261003_2300.png" loading="lazy" alt="STRKUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">PUMPUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-07-20 02:30 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +14.7% ｜ 3x: +44.1% (+2.57R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.001733</b> ｜ 初始止損: <b>0.00163379</b> (風險 5.7%) ｜
+                出場: <b>0.00199</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$10,207</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(4.4%) + 帶寬(2.5%~3.2%) → 7.7x放量(加速8.9x) + 主買61.2%</div>
+              <a href="cards/PUMPUSDT_20260720_0230.png" target="_blank"><img src="cards/PUMPUSDT_20260720_0230.png" loading="lazy" alt="PUMPUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">AGTUSDT</span>
+                  <span class="tag" style="background:#d97706;color:#fff;">★ M2 · 極致窒息核爆</span>
+                  <span class="time">2026-05-22 10:00 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +13.9% ｜ 3x: +41.8% (+1.38R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.011608</b> ｜ 初始止損: <b>0.0104395</b> (風險 10.1%) ｜
+                出場: <b>0.013239</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$1,502</b>
+              </div>
+              <div class="card-note">★M2極致窒息核爆：6h帶寬≤2.0% + 振幅2.5% → 36.3x巨量 + 主買54.4% + 實體94%</div>
+              <a href="cards/AGTUSDT_20260522_1000.png" target="_blank"><img src="cards/AGTUSDT_20260522_1000.png" loading="lazy" alt="AGTUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">BCHUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-09-22 20:30 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +11.5% ｜ 3x: +34.6% (+0.99R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>296.97</b> ｜ 初始止損: <b>262.242</b> (風險 11.7%) ｜
+                出場: <b>331.6</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$56,740</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(5.3%) + 帶寬(2.7%~3.5%) → 47.6x放量(加速86.6x) + 主買56.1%</div>
+              <a href="cards/BCHUSDT_20260922_2030.png" target="_blank"><img src="cards/BCHUSDT_20260922_2030.png" loading="lazy" alt="BCHUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">FETUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-08-21 01:15 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +10.9% ｜ 3x: +32.7% (+1.30R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.1433</b> ｜ 初始止損: <b>0.13124</b> (風險 8.4%) ｜
+                出場: <b>0.1591</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$14,707</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(11.5%) + 帶寬(1.6%~5.8%) → 6.2x放量(加速2.7x) + 主買56.6%</div>
+              <a href="cards/FETUSDT_20260821_0115.png" target="_blank"><img src="cards/FETUSDT_20260821_0115.png" loading="lazy" alt="FETUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">FILUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-09-13 22:00 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +10.1% ｜ 3x: +30.3% (+0.93R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.8915</b> ｜ 初始止損: <b>0.794209</b> (風險 10.9%) ｜
+                出場: <b>0.9827</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$39,466</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(5.7%) + 帶寬(2.5%~6.0%) → 9.7x放量(加速4.5x) + 主買53.2%</div>
+              <a href="cards/FILUSDT_20260913_2200.png" target="_blank"><img src="cards/FILUSDT_20260913_2200.png" loading="lazy" alt="FILUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">QNTUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-10-26 01:45 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +7.0% ｜ 3x: +20.9% (+0.76R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>197.41</b> ｜ 初始止損: <b>179.239</b> (風險 9.2%) ｜
+                出場: <b>211.41</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$129,900</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(7.6%) + 帶寬(3.6%~4.6%) → 7.1x放量(加速3.5x) + 主買54.0%</div>
+              <a href="cards/QNTUSDT_20261026_0145.png" target="_blank"><img src="cards/QNTUSDT_20261026_0145.png" loading="lazy" alt="QNTUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">UNIUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-09-06 00:15 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +6.2% ｜ 3x: +18.7% (+0.89R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>6.628</b> ｜ 初始止損: <b>6.16303</b> (風險 7.0%) ｜
+                出場: <b>7.05</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$30,282</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(6.3%) + 帶寬(2.5%~3.5%) → 10.7x放量(加速8.4x) + 主買58.0%</div>
+              <a href="cards/UNIUSDT_20260906_0015.png" target="_blank"><img src="cards/UNIUSDT_20260906_0015.png" loading="lazy" alt="UNIUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">1000PEPEUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-10-20 21:45 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +4.8% ｜ 3x: +14.5% (+0.94R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.0043539</b> ｜ 初始止損: <b>0.00413015</b> (風險 5.1%) ｜
+                出場: <b>0.0045702</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$107,431</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(5.5%) + 帶寬(1.4%~2.1%) → 7.0x放量(加速2.6x) + 主買61.6%</div>
+              <a href="cards/1000PEPEUSDT_20261020_2145.png" target="_blank"><img src="cards/1000PEPEUSDT_20261020_2145.png" loading="lazy" alt="1000PEPEUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">ZECUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-09-03 23:15 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +4.2% ｜ 3x: +12.7% (+0.42R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>914.75</b> ｜ 初始止損: <b>821.93</b> (風險 10.1%) ｜
+                出場: <b>954.55</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$25,502</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(7.5%) + 帶寬(3.5%~5.3%) → 11.2x放量(加速3.2x) + 主買59.3%</div>
+              <a href="cards/ZECUSDT_20260903_2315.png" target="_blank"><img src="cards/ZECUSDT_20260903_2315.png" loading="lazy" alt="ZECUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">ADAUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-10-05 06:30 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +3.5% ｜ 3x: +10.6% (+0.45R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.2661</b> ｜ 初始止損: <b>0.245367</b> (風險 7.8%) ｜
+                出場: <b>0.2758</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$93,790</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(6.4%) + 帶寬(3.9%~4.2%) → 17.8x放量(加速4.5x) + 主買54.7%</div>
+              <a href="cards/ADAUSDT_20261005_0630.png" target="_blank"><img src="cards/ADAUSDT_20261005_0630.png" loading="lazy" alt="ADAUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">QNTUSDT</span>
+                  <span class="tag" style="background:#d97706;color:#fff;">★ M2 · 極致窒息核爆</span>
+                  <span class="time">2026-05-22 14:45 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +3.3% ｜ 3x: +9.8% (+0.64R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>76.54</b> ｜ 初始止損: <b>72.6151</b> (風險 5.1%) ｜
+                出場: <b>79.13</b> (跌破BB中軌止盈) ｜ <i>(與前單重疊略過)</i>
+              </div>
+              <div class="card-note">★M2極致窒息核爆：6h帶寬≤2.1% + 振幅1.9% → 43.2x巨量 + 主買61.8% + 實體91%</div>
+              <a href="cards/QNTUSDT_20260522_1445.png" target="_blank"><img src="cards/QNTUSDT_20260522_1445.png" loading="lazy" alt="QNTUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">PUMPUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-07-27 05:15 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +2.7% ｜ 3x: +8.0% (+0.44R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.001941</b> ｜ 初始止損: <b>0.00182483</b> (風險 6.0%) ｜
+                出場: <b>0.001995</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$11,081</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(7.5%) + 帶寬(2.2%~4.3%) → 15.6x放量(加速3.6x) + 主買55.8%</div>
+              <a href="cards/PUMPUSDT_20260727_0515.png" target="_blank"><img src="cards/PUMPUSDT_20260727_0515.png" loading="lazy" alt="PUMPUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">FETUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-05-22 12:00 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +2.4% ｜ 3x: +7.1% (+0.26R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.2102</b> ｜ 初始止損: <b>0.191239</b> (風險 9.0%) ｜
+                出場: <b>0.2154</b> (跌破BB中軌止盈) ｜ <i>(與前單重疊略過)</i>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(6.6%) + 帶寬(1.5%~6.0%) → 11.8x放量(加速2.3x) + 主買58.0%</div>
+              <a href="cards/FETUSDT_20260522_1200.png" target="_blank"><img src="cards/FETUSDT_20260522_1200.png" loading="lazy" alt="FETUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">INITUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-09-17 12:45 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +2.3% ｜ 3x: +6.8% (+0.24R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.07381</b> ｜ 初始止損: <b>0.066854</b> (風險 9.4%) ｜
+                出場: <b>0.07557</b> (時間到期) ｜ 滾倉餘額 <b>$42,147</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(7.2%) + 帶寬(2.0%~3.4%) → 51.0x放量(加速7.8x) + 主買68.0%</div>
+              <a href="cards/INITUSDT_20260917_1245.png" target="_blank"><img src="cards/INITUSDT_20260917_1245.png" loading="lazy" alt="INITUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">VVVUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-08-21 13:00 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +2.2% ｜ 3x: +6.6% (+0.34R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>15.264</b> ｜ 初始止損: <b>14.2703</b> (風險 6.5%) ｜
+                出場: <b>15.62</b> (跌破BB中軌止盈) ｜ <i>(與前單重疊略過)</i>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(7.2%) + 帶寬(2.7%~3.2%) → 7.6x放量(加速5.6x) + 主買62.9%</div>
+              <a href="cards/VVVUSDT_20260821_1300.png" target="_blank"><img src="cards/VVVUSDT_20260821_1300.png" loading="lazy" alt="VVVUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">TIAUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-05-21 03:15 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +2.0% ｜ 3x: +5.9% (+0.33R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.4156</b> ｜ 初始止損: <b>0.390538</b> (風險 6.0%) ｜
+                出場: <b>0.4243</b> (跌破BB中軌止盈) ｜ 滾倉餘額 <b>$1,059</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(7.5%) + 帶寬(2.0%~4.8%) → 10.4x放量(加速13.3x) + 主買58.6%</div>
+              <a href="cards/TIAUSDT_20260521_0315.png" target="_blank"><img src="cards/TIAUSDT_20260521_0315.png" loading="lazy" alt="TIAUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">CAPUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-07-20 18:30 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +0.2% ｜ 3x: +0.5% (+0.03R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.0201</b> ｜ 初始止損: <b>0.0190144</b> (風險 5.4%) ｜
+                出場: <b>0.0201603</b> (保本止盈) ｜ 滾倉餘額 <b>$10,262</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(7.0%) + 帶寬(1.2%~6.2%) → 9.0x放量(加速19.2x) + 主買66.3%</div>
+              <a href="cards/CAPUSDT_20260720_1830.png" target="_blank"><img src="cards/CAPUSDT_20260720_1830.png" loading="lazy" alt="CAPUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">CAPUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-11-10 21:30 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +0.2% ｜ 3x: +0.5% (+0.02R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.10894</b> ｜ 初始止損: <b>0.0987538</b> (風險 9.4%) ｜
+                出場: <b>0.109267</b> (保本止盈) ｜ 滾倉餘額 <b>$346,962</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(7.4%) + 帶寬(1.8%~5.3%) → 9.4x放量(加速1.8x) + 主買59.0%</div>
+              <a href="cards/CAPUSDT_20261110_2130.png" target="_blank"><img src="cards/CAPUSDT_20261110_2130.png" loading="lazy" alt="CAPUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">1000PEPEUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-10-28 09:30 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +0.2% ｜ 3x: +0.5% (+0.02R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.0049338</b> ｜ 初始止損: <b>0.00442914</b> (風險 10.2%) ｜
+                出場: <b>0.0049486</b> (保本止盈) ｜ 滾倉餘額 <b>$345,099</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(8.5%) + 帶寬(3.2%~5.0%) → 13.7x放量(加速2.4x) + 主買54.0%</div>
+              <a href="cards/1000PEPEUSDT_20261028_0930.png" target="_blank"><img src="cards/1000PEPEUSDT_20261028_0930.png" loading="lazy" alt="1000PEPEUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">GRAMUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-08-21 13:45 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +0.2% ｜ 3x: +0.5% (+0.04R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>1.46</b> ｜ 初始止損: <b>1.38504</b> (風險 5.1%) ｜
+                出場: <b>1.46438</b> (保本止盈) ｜ <i>(與前單重疊略過)</i>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(5.3%) + 帶寬(1.9%~2.7%) → 16.2x放量(加速39.4x) + 主買62.4%</div>
+              <a href="cards/GRAMUSDT_20260821_1345.png" target="_blank"><img src="cards/GRAMUSDT_20260821_1345.png" loading="lazy" alt="GRAMUSDT"/></a>
+            </div>
+            
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <span class="sym">1000PEPEUSDT</span>
+                  <span class="tag" style="background:#059669;color:#fff;">★ M1 · VWAP護盤突破</span>
+                  <span class="time">2026-10-02 12:15 TPE</span>
+                </div>
+                <div class="pnl-badge" style="background:#00c853">
+                  1x: +0.2% ｜ 3x: +0.5% (+0.04R)
+                </div>
+              </div>
+              <div class="card-meta">
+                進場: <b>0.0045736</b> ｜ 初始止損: <b>0.00435362</b> (風險 4.8%) ｜
+                出場: <b>0.00458732</b> (保本止盈) ｜ 滾倉餘額 <b>$57,046</b>
+              </div>
+              <div class="card-note">★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體(5.7%) + 帶寬(1.5%~2.0%) → 8.1x放量(加速3.8x) + 主買70.0%</div>
+              <a href="cards/1000PEPEUSDT_20261002_1215.png" target="_blank"><img src="cards/1000PEPEUSDT_20261002_1215.png" loading="lazy" alt="1000PEPEUSDT"/></a>
+            </div>
+            
+  </div>
+
+  <h2>📋 完整 27 筆交易明細表</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>進場時間 (TPE)</th><th>幣種</th><th>模式</th><th>進場價</th><th>止損 (風險)</th>
+          <th>壓縮BBW</th><th>成交額倍數</th><th>主動買盤</th><th>後續最高</th>
+          <th>趨勢追蹤淨利</th><th>對照固定3R</th><th>出場原因</th>
+        </tr>
+      </thead>
+      <tbody><tr><td>2026-11-14 21:30</td><td><b>EVAAUSDT</b></td><td>M1 護盤突破</td><td>1.1467</td><td>1.05848 (-7.7%)</td><td>4.1%~6.5%</td><td>6.4x</td><td>52.3%</td><td>+76.7%</td><td class='pos'>+57.05% (+7.42R)</td><td>+22.96%</td><td>時間到期</td></tr><tr><td>2026-11-13 23:30</td><td><b>SHELLUSDT</b></td><td>M1 護盤突破</td><td>0.02134</td><td>0.019303 (-9.5%)</td><td>1.8%~6.0%</td><td>52.3x</td><td>67.2%</td><td>+137.0%</td><td class='pos'>+77.34% (+8.10R)</td><td>+28.52%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-11-10 21:30</td><td><b>CAPUSDT</b></td><td>M1 護盤突破</td><td>0.10894</td><td>0.0987538 (-9.4%)</td><td>1.8%~5.3%</td><td>9.4x</td><td>59.0%</td><td>+18.2%</td><td class='pos'>+0.18% (+0.02R)</td><td>-9.47%</td><td>保本止盈</td></tr><tr><td>2026-10-28 09:30</td><td><b>1000PEPEUSDT</b></td><td>M1 護盤突破</td><td>0.0049338</td><td>0.00442914 (-10.2%)</td><td>3.2%~5.0%</td><td>13.7x</td><td>54.0%</td><td>+15.3%</td><td class='pos'>+0.18% (+0.02R)</td><td>+9.70%</td><td>保本止盈</td></tr><tr><td>2026-10-27 21:30</td><td><b>EVAAUSDT</b></td><td>M1 護盤突破</td><td>0.5816</td><td>0.516703 (-11.2%)</td><td>4.5%~6.8%</td><td>7.0x</td><td>57.8%</td><td>+176.8%</td><td class='pos'>+54.75% (+4.91R)</td><td>+33.35%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-10-26 01:45</td><td><b>QNTUSDT</b></td><td>M1 護盤突破</td><td>197.41</td><td>179.239 (-9.2%)</td><td>3.6%~4.6%</td><td>7.1x</td><td>54.0%</td><td>+13.4%</td><td class='pos'>+6.97% (+0.76R)</td><td>+3.40%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-10-20 21:45</td><td><b>1000PEPEUSDT</b></td><td>M1 護盤突破</td><td>0.0043539</td><td>0.00413015 (-5.1%)</td><td>1.4%~2.1%</td><td>7.0x</td><td>61.6%</td><td>+10.2%</td><td class='pos'>+4.85% (+0.94R)</td><td>+3.12%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-10-05 06:30</td><td><b>ADAUSDT</b></td><td>M1 護盤突破</td><td>0.2661</td><td>0.245367 (-7.8%)</td><td>3.9%~4.2%</td><td>17.8x</td><td>54.7%</td><td>+6.2%</td><td class='pos'>+3.53% (+0.45R)</td><td>+3.26%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-10-03 23:00</td><td><b>STRKUSDT</b></td><td>M1 護盤突破</td><td>0.04557</td><td>0.0425163 (-6.7%)</td><td>1.9%~5.0%</td><td>7.9x</td><td>58.8%</td><td>+33.6%</td><td class='pos'>+16.23% (+2.42R)</td><td>+19.98%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-10-02 12:15</td><td><b>1000PEPEUSDT</b></td><td>M1 護盤突破</td><td>0.0045736</td><td>0.00435362 (-4.8%)</td><td>1.5%~2.0%</td><td>8.1x</td><td>70.0%</td><td>+3.9%</td><td class='pos'>+0.18% (+0.04R)</td><td>-4.93%</td><td>保本止盈</td></tr><tr><td>2026-09-22 20:30</td><td><b>BCHUSDT</b></td><td>M1 護盤突破</td><td>296.97</td><td>262.242 (-11.7%)</td><td>2.7%~3.5%</td><td>47.6x</td><td>56.1%</td><td>+23.4%</td><td class='pos'>+11.54% (+0.99R)</td><td>+14.47%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-09-17 12:45</td><td><b>INITUSDT</b></td><td>M1 護盤突破</td><td>0.07381</td><td>0.066854 (-9.4%)</td><td>2.0%~3.4%</td><td>51.0x</td><td>68.0%</td><td>+4.7%</td><td class='pos'>+2.26% (+0.24R)</td><td>+2.26%</td><td>時間到期</td></tr><tr><td>2026-09-13 22:00</td><td><b>FILUSDT</b></td><td>M1 護盤突破</td><td>0.8915</td><td>0.794209 (-10.9%)</td><td>2.5%~6.0%</td><td>9.7x</td><td>53.2%</td><td>+16.6%</td><td class='pos'>+10.11% (+0.93R)</td><td>-0.37%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-09-06 00:15</td><td><b>UNIUSDT</b></td><td>M1 護盤突破</td><td>6.628</td><td>6.16303 (-7.0%)</td><td>2.5%~3.5%</td><td>10.7x</td><td>58.0%</td><td>+12.9%</td><td class='pos'>+6.25% (+0.89R)</td><td>+6.29%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-09-03 23:15</td><td><b>ZECUSDT</b></td><td>M1 護盤突破</td><td>914.75</td><td>821.93 (-10.1%)</td><td>3.5%~5.3%</td><td>11.2x</td><td>59.3%</td><td>+14.8%</td><td class='pos'>+4.23% (+0.42R)</td><td>+10.28%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-09-01 01:45</td><td><b>ARBUSDT</b></td><td>M1 護盤突破</td><td>0.09415</td><td>0.0842865 (-10.5%)</td><td>2.7%~5.1%</td><td>13.1x</td><td>55.7%</td><td>+27.6%</td><td class='pos'>+17.96% (+1.71R)</td><td>+21.83%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-08-21 13:45</td><td><b>GRAMUSDT</b></td><td>M1 護盤突破</td><td>1.46</td><td>1.38504 (-5.1%)</td><td>1.9%~2.7%</td><td>16.2x</td><td>62.4%</td><td>+7.0%</td><td class='pos'>+0.18% (+0.04R)</td><td>-5.25%</td><td>保本止盈</td></tr><tr><td>2026-08-21 13:00</td><td><b>VVVUSDT</b></td><td>M1 護盤突破</td><td>15.264</td><td>14.2703 (-6.5%)</td><td>2.7%~3.2%</td><td>7.6x</td><td>62.9%</td><td>+16.9%</td><td class='pos'>+2.21% (+0.34R)</td><td>-6.63%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-08-21 01:15</td><td><b>FETUSDT</b></td><td>M1 護盤突破</td><td>0.1433</td><td>0.13124 (-8.4%)</td><td>1.6%~5.8%</td><td>6.2x</td><td>56.6%</td><td>+28.9%</td><td class='pos'>+10.91% (+1.30R)</td><td>+25.13%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-07-27 05:15</td><td><b>PUMPUSDT</b></td><td>M1 護盤突破</td><td>0.001941</td><td>0.00182483 (-6.0%)</td><td>2.2%~4.3%</td><td>15.6x</td><td>55.8%</td><td>+12.5%</td><td class='pos'>+2.66% (+0.44R)</td><td>+2.92%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-07-20 18:30</td><td><b>CAPUSDT</b></td><td>M1 護盤突破</td><td>0.0201</td><td>0.0190144 (-5.4%)</td><td>1.2%~6.2%</td><td>9.0x</td><td>66.3%</td><td>+8.9%</td><td class='pos'>+0.18% (+0.03R)</td><td>-5.52%</td><td>保本止盈</td></tr><tr><td>2026-07-20 02:30</td><td><b>PUMPUSDT</b></td><td>M1 護盤突破</td><td>0.001733</td><td>0.00163379 (-5.7%)</td><td>2.5%~3.2%</td><td>7.7x</td><td>61.2%</td><td>+21.0%</td><td class='pos'>+14.71% (+2.57R)</td><td>+17.05%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-06-29 15:00</td><td><b>TACUSDT</b></td><td>M2 極致核爆</td><td>0.022949</td><td>0.0216214 (-5.8%)</td><td>1.2%~1.9%</td><td>38.0x</td><td>58.6%</td><td>+199.4%</td><td class='pos'>+123.84% (+21.41R)</td><td>+17.24%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-05-22 14:45</td><td><b>QNTUSDT</b></td><td>M2 極致核爆</td><td>76.54</td><td>72.6151 (-5.1%)</td><td>1.1%~2.1%</td><td>43.2x</td><td>61.8%</td><td>+7.3%</td><td class='pos'>+3.26% (+0.64R)</td><td>+2.17%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-05-22 12:00</td><td><b>FETUSDT</b></td><td>M1 護盤突破</td><td>0.2102</td><td>0.191239 (-9.0%)</td><td>1.5%~6.0%</td><td>11.8x</td><td>58.0%</td><td>+6.3%</td><td class='pos'>+2.35% (+0.26R)</td><td>-9.14%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-05-22 10:00</td><td><b>AGTUSDT</b></td><td>M2 極致核爆</td><td>0.011608</td><td>0.0104395 (-10.1%)</td><td>1.0%~2.0%</td><td>36.3x</td><td>54.4%</td><td>+26.2%</td><td class='pos'>+13.93% (+1.38R)</td><td>+19.76%</td><td>跌破BB中軌止盈</td></tr><tr><td>2026-05-21 03:15</td><td><b>TIAUSDT</b></td><td>M1 護盤突破</td><td>0.4156</td><td>0.390538 (-6.0%)</td><td>2.0%~4.8%</td><td>10.4x</td><td>58.6%</td><td>+9.1%</td><td class='pos'>+1.97% (+0.33R)</td><td>+7.07%</td><td>跌破BB中軌止盈</td></tr></tbody>
+    </table>
+  </div>
+</div>
+</body>
+</html>

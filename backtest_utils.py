@@ -1044,8 +1044,8 @@ def fmt_pf(pf: Optional[float]) -> str:
     return f"{pf:.2f}"
 
 
-def compute_profit_factor(pnls: Sequence[float]) -> Optional[float]:
-    if not pnls:
+def compute_profit_factor(pnls: Sequence[float] | np.ndarray) -> Optional[float]:
+    if len(pnls) == 0:
         return None
     arr = np.asarray(pnls, dtype=float)
     gp = float(np.sum(arr[arr > 0.0]))

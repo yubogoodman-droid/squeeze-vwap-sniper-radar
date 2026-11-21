@@ -522,7 +522,6 @@ function analyzeSymbol(raw, symbol, interval, preset, recentBars, dropForming = 
     }
     const tbrP8 = (tbrSum8 / 8) * 100;
     const volAccel = qv[i] / Math.max(qv[i - 1], 1.0);
-    const distS60 = ((c[i - 1] - sma60[i - 1]) / sma60[i - 1]) * 100;
     const distS480 = ((c[i - 1] - sma480[i - 1]) / sma480[i - 1]) * 100;
     const slpS60 = ((sma60[i] - sma60[i - 20]) / sma60[i - 20]) * 100;
     const slpS200 = ((sma200[i] - sma200[i - 20]) / sma200[i - 20]) * 100;
@@ -539,7 +538,6 @@ function analyzeSymbol(raw, symbol, interval, preset, recentBars, dropForming = 
       rng96 <= 11.5 &&
       rng48 <= 8.20 &&
       distS480 >= -2.0 && distS480 <= 12.0 &&
-      (distS60 <= 2.00 || distS60 >= 3.70) &&
       slpS60 >= 0.52 &&
       slpS200 >= -0.10 &&
       volAccel >= 1.70

@@ -37,6 +37,8 @@ import squeeze_breakout_radar as radar
 
 TPE = ZoneInfo("Asia/Taipei")
 FEE_ROUNDTRIP_PCT = 0.12
+BREAKEVEN_ARM_R = 0.55
+BREAKEVEN_BUFFER_PCT = 0.30
 WEIGHT_LOCK = threading.Lock()
 LAST_WEIGHT = 0
 COOLDOWN_UNTIL = 0.0
@@ -215,12 +217,19 @@ class SimTrade:
     exit_reason_trend: str
     max_fav_pct: float
     hold_bars: int
+    is_oos: bool = False
     card_rel_path: str = ""
     hit: Optional[radar.RadarHit] = None
 
 
-def simulate_trade(df: pd.DataFrame, hit: radar.RadarHit, max_hold_bars: int = 160) -> Optional[SimTrade]:
-    """從訊號收盤價進場，模擬抗回踩趨勢追蹤出場（+0.6R 保本鎖定 + 跌破 BB 中軌止盈，扣 0.12% 費滑）。"""
+def simulate_trade(
+    df: pd.DataFrame,
+    hit: radar.RadarHit,
+    max_hold_bars: int = 160,
+    breakeven_arm_r: float = BREAKEVEN_ARM_R,
+    breakeven_buffer_pct: float = BREAKEVEN_BUFFER_PCT,
+) -> Optional[SimTrade]:
+    """從訊號收盤價進場，模擬抗回踩趨勢追蹤出場（+0.55R 保本鎖定 + 跌破 BB 中軌止盈，扣費滑）。"""
     i0 = hit.bar_idx
     if i0 >= len(df) - 2:
         return None
@@ -256,7 +265,7 @@ def simulate_trade(df: pd.DataFrame, hit: radar.RadarHit, max_hold_bars: int = 1
     pnl_3r = (exit_3r - entry) / entry * 100.0 - FEE_ROUNDTRIP_PCT
     r_3r = pnl_3r / risk_pct
 
-    # 2) 主戰策略：抗回踩趨勢追蹤 (+0.6R 保本保護，確認脫離成本後跌破 BB 中軌止盈)
+    # 2) 主戰策略：抗回踩趨勢追蹤 (+0.55R 保本保護，確認脫離成本後跌破 BB 中軌止盈)
     cur_stop = stop
     armed = False
     exit_idx = end_i
@@ -269,9 +278,9 @@ def simulate_trade(df: pd.DataFrame, hit: radar.RadarHit, max_hold_bars: int = 1
             exit_idx = k
             reason = "保本止盈" if armed else "初始止損"
             break
-        if highs[k] >= entry + 0.55 * risk:
+        if highs[k] >= entry + breakeven_arm_r * risk:
             armed = True
-            cur_stop = max(cur_stop, entry * 1.003)
+            cur_stop = max(cur_stop, entry * (1.0 + breakeven_buffer_pct / 100.0))
         if armed and (k - i0) >= 2 and np.isfinite(bb_mid[k]) and closes[k] < bb_mid[k]:
             exit_px = max(closes[k], cur_stop)
             exit_idx = k
@@ -545,6 +554,26 @@ def render_trade_cards(
         tr.card_rel_path = f"cards/{fname}"
 
 
+def _to_basic_portfolio_inputs(trades: Sequence[SimTrade]) -> List[bt_utils.PortfolioTradeInput]:
+    return [
+        bt_utils.PortfolioTradeInput(
+            symbol=t.symbol,
+            entry_time=t.entry_time,
+            exit_time=t.exit_time_trend,
+            entry_price=t.entry_price,
+            stop_price=t.stop_price,
+            exit_price=t.exit_price_trend,
+            risk_pct=t.risk_pct,
+            net_pnl_pct=t.pnl_trend,
+            r_mult=t.r_trend,
+            worst_low_price=min(t.entry_price, t.exit_price_trend),
+            priority=float(t.score) * 1000.0 + float(t.qv_mult),
+            payload=t,
+        )
+        for t in trades
+    ]
+
+
 def write_html_report(
     trades: Sequence[SimTrade],
     port: Dict[str, Any],
@@ -552,6 +581,7 @@ def write_html_report(
     days: int,
     n_syms: int,
     eq_filename: str = "equity_curve_180d.png",
+    oos_report: Optional[Dict[str, Any]] = None,
 ) -> Path:
     m1_list = [t for t in trades if t.mode == "VWAP_COIL_BREAK"]
     m2_list = [t for t in trades if t.mode == "ULTRA_SQUEEZE_CLIMAX"]
@@ -570,6 +600,7 @@ def write_html_report(
         is_m2 = t.mode == "ULTRA_SQUEEZE_CLIMAX"
         tag_bg = "#d97706" if is_m2 else "#059669"
         tag_lbl = "★ M2 · 極致窒息核爆" if is_m2 else "★ M1 · VWAP護盤突破"
+        oos_badge = " [OOS]" if t.is_oos else " [IS]"
         pnl_bg = "#00c853" if t.pnl_trend > 0 else "#dc2626"
         ex_pair = exec_map.get((t.symbol, t.entry_time))
         bal_str = f" ｜ 滾倉餘額 <b>${ex_pair[1]:,.0f}</b>" if ex_pair else " ｜ <i>(與前單重疊略過)</i>"
@@ -585,7 +616,7 @@ def write_html_report(
               <div class="card-header">
                 <div>
                   <span class="sym">{escape(t.symbol)}</span>
-                  <span class="tag" style="background:{tag_bg};color:#fff;">{tag_lbl}</span>
+                  <span class="tag" style="background:{tag_bg};color:#fff;">{tag_lbl}{oos_badge}</span>
                   <span class="time">{t.entry_time.strftime('%Y-%m-%d %H:%M')} TPE</span>
                 </div>
                 <div class="pnl-badge" style="background:{pnl_bg}">
@@ -606,9 +637,11 @@ def write_html_report(
     for t in sorted(trades, key=lambda x: x.entry_time, reverse=True):
         cls = "pos" if t.pnl_trend > 0 else "neg"
         m_short = "M2 極致核爆" if t.mode == "ULTRA_SQUEEZE_CLIMAX" else "M1 護盤突破"
+        split_lbl = "OOS" if t.is_oos else "IS"
         rows_html.append(
             f"<tr><td>{t.entry_time.strftime('%Y-%m-%d %H:%M')}</td>"
             f"<td><b>{escape(t.symbol)}</b></td>"
+            f"<td>{split_lbl}</td>"
             f"<td>{m_short}</td>"
             f"<td>{t.entry_price:.6g}</td><td>{t.stop_price:.6g} (-{t.risk_pct:.1f}%)</td>"
             f"<td>{t.bbw_min10_pct:.1f}%~{t.bbw_max24_pct:.1f}%</td>"
@@ -621,6 +654,7 @@ def write_html_report(
 
     m1_top = "、".join(f"{t.symbol.replace('USDT','')} ({t.pnl_trend:+.0f}%)" for t in sorted(m1_list, key=lambda x: x.pnl_trend, reverse=True)[:4]) or "-"
     m2_top = "、".join(f"{t.symbol.replace('USDT','')} ({t.pnl_trend:+.0f}%)" for t in sorted(m2_list, key=lambda x: x.pnl_trend, reverse=True)[:4]) or "-"
+    oos_section_html = bt_utils.render_oos_walkforward_html(oos_report) if oos_report else ""
 
     html = f"""<!doctype html>
 <html lang="zh-Hant">
@@ -665,7 +699,7 @@ def write_html_report(
   <h1>🎯 Squeeze × VWAP 護盤 × 主動買盤｜雙模狙擊 v2 過去 {days} 天 ({period_label}) 實戰戰報</h1>
   <div class="sub">
     K線週期：<b>15m</b> ｜ 掃描標的池：<b>{n_syms} 檔幣安 USDT 永續合約（完全獨立腳本 · 0% 依賴均線腳本）</b> ｜
-    出場策略：<b>+0.6R 移保本(+0.3%) + 抗回踩後跌破 BB 中軌止盈</b>（已扣雙邊手續費與滑價 {FEE_ROUNDTRIP_PCT:.2f}%）
+    出場策略：<b>+{BREAKEVEN_ARM_R:.2f}R 移保本(+{BREAKEVEN_BUFFER_PCT:.2f}%) + 抗回踩後跌破 BB 中軌止盈</b>（已扣雙邊手續費與滑價 {FEE_ROUNDTRIP_PCT:.2f}%）
   </div>
 
   <div class="kpis">
@@ -677,6 +711,8 @@ def write_html_report(
     <div class="kpi"><div class="label">固定 3x 不滾倉最終資金</div><div class="val">${port['eq_fixed']:,.2f}</div></div>
     <div class="kpi"><div class="label">最大連虧次數</div><div class="val amber">{st_all['max_loss_streak']} 次</div></div>
   </div>
+
+  {oos_section_html}
 
   <h2>⚡ 雙模分項表現對照（極致提純去噪後表現）</h2>
   <div class="table-wrap">
@@ -735,7 +771,7 @@ def write_html_report(
     <table>
       <thead>
         <tr>
-          <th>進場時間 (TPE)</th><th>幣種</th><th>模式</th><th>進場價</th><th>止損 (風險)</th>
+          <th>進場時間 (TPE)</th><th>幣種</th><th>區間</th><th>模式</th><th>進場價</th><th>止損 (風險)</th>
           <th>壓縮BBW</th><th>成交額倍數</th><th>主動買盤</th><th>後續最高</th>
           <th>趨勢追蹤淨利</th><th>對照固定3R</th><th>出場原因</th>
         </tr>
@@ -767,12 +803,26 @@ def main() -> int:
         default=0,
         help="訊號當下前 24h 滾動成交額排名前 N 過濾 (0=全部符合 min-vol 標的，不按字母截斷)",
     )
-    parser.add_argument("--min-vol", type=float, default=2_000_000, help="訊號當下前 24h 最低滾動成交額 (USDT)")
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--out-dir", type=str, default="")
-    parser.add_argument("--cache-dir", type=str, default=os.environ.get("BINANCE_CACHE_DIR", ""))
-    parser.add_argument("--npz-dir", type=str, default=os.environ.get("BINANCE_NPZ_DIR", ""))
+    parser.add_argument("--min-vol", type=float, default=2_000_000, help="訊號當下前 24h 最低滾動成交額 USDT (預設 2000000)")
+    parser.add_argument("--workers", type=int, default=4, help="載入執行緒數 (預設 4)")
+    parser.add_argument("--breakeven-r", type=float, default=BREAKEVEN_ARM_R, help=f"觸發保本止損所需浮盈 R 倍數 (預設 {BREAKEVEN_ARM_R})")
+    parser.add_argument(
+        "--breakeven-buffer-pct",
+        type=float,
+        default=BREAKEVEN_BUFFER_PCT,
+        help=f"保本止損高於進場價之緩衝 %% (預設 {BREAKEVEN_BUFFER_PCT})",
+    )
+    parser.add_argument("--max-hold-bars", type=int, default=160, help="最長持有 K 線根數 (預設 160)")
+    parser.add_argument("--oos-date", type=str, default="", help="樣本外盲測切分日期 YYYY-MM-DD (預設依 --oos-ratio 自動切分)")
+    parser.add_argument("--oos-ratio", type=float, default=0.30, help="樣本外盲測時間佔比 (預設 0.30 = 後 30%% 為 OOS)")
+    parser.add_argument("--wf-folds", type=int, default=4, help="Walk-Forward 時間切片期數 (預設 4)")
+    parser.add_argument("--skip-cards", action="store_true", help="略過單筆復盤圖卡繪製以加速驗證")
+    parser.add_argument("--out-dir", type=str, default="", help="輸出資料夾路徑")
+    parser.add_argument("--cache-dir", type=str, default=os.environ.get("BINANCE_CACHE_DIR", ""), help="K線快取資料夾 (環境變數 BINANCE_CACHE_DIR)")
+    parser.add_argument("--npz-dir", type=str, default=os.environ.get("BINANCE_NPZ_DIR", ""), help="NPZ快取資料夾 (環境變數 BINANCE_NPZ_DIR)")
+    radar.add_radar_threshold_args(parser)
     args = parser.parse_args()
+    radar_cfg = radar.radar_config_from_args(args)
 
     out_dir = Path(args.out_dir) if args.out_dir else Path(f"breakout_output/backtest_{args.days}d_squeeze")
     cache_dir = Path(args.cache_dir) if args.cache_dir else Path(f"breakout_output/cache_{args.days}d")
@@ -838,7 +888,7 @@ def main() -> int:
     eval_start = max(min_ts.to_pydatetime(), max_ts.to_pydatetime() - timedelta(days=args.days))
 
     for sym, df in sorted(all_dfs.items()):
-        hits = radar.scan_squeeze_breakouts(df, sym, interval=args.interval, sniper_only=True)
+        hits = radar.scan_squeeze_breakouts(df, sym, interval=args.interval, sniper_only=True, config=radar_cfg)
         sym_trades: List[SimTrade] = []
         for h in hits:
             if h.timestamp < eval_start:
@@ -848,7 +898,13 @@ def main() -> int:
             )
             if not ok_vol:
                 continue
-            tr = simulate_trade(df, h)
+            tr = simulate_trade(
+                df,
+                h,
+                max_hold_bars=args.max_hold_bars,
+                breakeven_arm_r=args.breakeven_r,
+                breakeven_buffer_pct=args.breakeven_buffer_pct,
+            )
             if tr is not None:
                 sym_trades.append(tr)
         if sym_trades:
@@ -860,8 +916,23 @@ def main() -> int:
         print("回測期間內無符合條件之交易。")
         return 0
 
+    oos_report = bt_utils.compute_oos_and_walkforward(
+        _to_basic_portfolio_inputs(all_trades),
+        window_start=eval_start,
+        window_end=max_ts.to_pydatetime(),
+        oos_split_date=args.oos_date,
+        oos_ratio=args.oos_ratio,
+        wf_folds=args.wf_folds,
+        initial_cap=1000.0,
+    )
+    split_ts = oos_report["split_ts"]
+    for t in all_trades:
+        t.is_oos = pd.Timestamp(t.entry_time) >= split_ts
+
     st_all = summarize_trades(all_trades)
     port = simulate_portfolio_3x(all_trades, initial_cap=1000.0, leverage=3.0)
+    ins_st = oos_report["in_sample"]
+    oos_st = oos_report["out_of_sample"]
 
     print("\n" + "=" * 105)
     print(f"🎯 Squeeze × VWAP 護盤雙模狙擊 v2｜{args.days} 天回測總結 ({len(all_dfs)} 檔｜共 {st_all['n']} 筆｜已扣 {FEE_ROUNDTRIP_PCT:.2f}% 費滑)")
@@ -874,23 +945,29 @@ def main() -> int:
     print(
         f"  3x 全倉滾倉 ($1,000 起): ${port['eq_comp']:,.2f} ({port['comp_ret_pct']:+,.1f}%) | MDD: {port['mdd']:.1f}%\n"
         f"  2% 以損定倉安全複利    : ${port['eq_risk2']:,.2f} ({port['risk2_ret_pct']:+,.1f}%) | MDD: {port['mdd_risk2']:.1f}%\n"
-        f"  固定 3x 單利           : ${port['eq_fixed']:,.2f} (執行 {port['executed_count']} 筆 / 重疊略過 {port['skipped_count']} 筆)"
+        f"  固定 3x 單利           : ${port['eq_fixed']:,.2f} (執行 {port['executed_count']} 筆 / 重疊略過 {port['skipped_count']} 筆)\n"
+        f"  [IS 樣本內 < {oos_report['split_str'][:10]}] {ins_st['n']} 筆 | 勝率 {ins_st['win_rate']:.1f}% | "
+        f"總R {ins_st['sum_r']:+.1f}R | PF {bt_utils.fmt_pf(ins_st['pf'])} | 2%定倉 ${ins_st['risk_eq']:,.0f}\n"
+        f"  [OOS 樣本外 >= {oos_report['split_str'][:10]}] {oos_st['n']} 筆 | 勝率 {oos_st['win_rate']:.1f}% | "
+        f"總R {oos_st['sum_r']:+.1f}R | PF {bt_utils.fmt_pf(oos_st['pf'])} | 2%定倉 ${oos_st['risk_eq']:,.0f}"
     )
     print("-" * 105)
     print("📋 全數交易明細：")
     for t in all_trades:
         m_tag = "M2" if t.mode == "ULTRA_SQUEEZE_CLIMAX" else "M1"
+        split_tag = "OOS" if t.is_oos else "IS "
         print(
-            f"  {t.entry_time.strftime('%Y-%m-%d %H:%M')} | {t.symbol:<12} | {m_tag} | 進:{t.entry_price:<9.5g} | "
+            f"  {t.entry_time.strftime('%Y-%m-%d %H:%M')} | {split_tag} | {t.symbol:<12} | {m_tag} | 進:{t.entry_price:<9.5g} | "
             f"1x:{t.pnl_trend:+6.1f}% ({t.r_trend:+5.2f}R) | 最高:+{t.max_fav_pct:5.1f}% | {t.exit_reason_trend}"
         )
     print("=" * 105)
 
     eq_filename = f"equity_curve_{args.days}d.png"
     out_dir.mkdir(parents=True, exist_ok=True)
-    render_trade_cards(all_trades, dfs_with_hits, out_dir / "cards")
+    if not args.skip_cards:
+        render_trade_cards(all_trades, dfs_with_hits, out_dir / "cards")
     plot_equity_curves(all_trades, port, out_dir / eq_filename, args.days, len(all_dfs))
-    report = write_html_report(all_trades, port, out_dir, args.days, len(all_dfs), eq_filename=eq_filename)
+    report = write_html_report(all_trades, port, out_dir, args.days, len(all_dfs), eq_filename=eq_filename, oos_report=oos_report)
     print(f"\n[圖表與報告已產出] {report.resolve()}")
     return 0
 

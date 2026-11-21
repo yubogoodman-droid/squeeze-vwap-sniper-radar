@@ -82,6 +82,125 @@ class RadarHit:
     funding_rate_pct: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class RadarConfig:
+    breakout_buffer_pct: float = 0.40
+    qv_mult_min: float = 6.0
+    min_bar_qv_usd: float = 250_000.0
+    tbr_min: float = 0.52
+    clv_min: float = 0.72
+    bar_gain_min_pct: float = 2.2
+    bar_gain_max_pct: float = 18.0
+    ext_vwap_max_pct: float = 14.0
+    base_bbw_max_pct: float = 7.5
+    base_rng6h_max_pct: float = 7.5
+    m1_bbw_min_low: float = 0.90
+    m1_bbw_min_high: float = 4.55
+    m1_bbw_max_pct: float = 6.90
+    m1_rng24h_max_pct: float = 11.5
+    m1_rng12h_max_pct: float = 8.20
+    m1_dist_s480_min_pct: float = -2.0
+    m1_dist_s480_max_pct: float = 12.0
+    m1_slp_s60_min_pct: float = 0.52
+    m1_slp_s200_min_pct: float = -0.10
+    m1_vol_accel_min: float = 1.70
+    m2_bbw_max_pct: float = 2.20
+    m2_rng6h_max_pct: float = 3.00
+    m2_qv_mult_min: float = 30.0
+    m2_clv_min: float = 0.90
+    m2_tbr_min: float = 0.54
+    min_risk_pct: float = 0.80
+    max_risk_pct: float = 14.0
+
+
+def add_radar_threshold_args(parser: argparse.ArgumentParser) -> None:
+    grp = parser.add_argument_group("雙模雷達偵測門檻參數 (Key Thresholds)")
+    d = RadarConfig()
+    grp.add_argument(
+        "--breakout-buffer-pct",
+        type=float,
+        default=d.breakout_buffer_pct,
+        help=f"收盤突破 24h Donchian 高點最低緩衝百分比 (預設 {d.breakout_buffer_pct})",
+    )
+    grp.add_argument(
+        "--qv-mult-min",
+        type=float,
+        default=d.qv_mult_min,
+        help=f"突破 K 線成交額相對中位數最低倍數 (預設 {d.qv_mult_min})",
+    )
+    grp.add_argument(
+        "--min-bar-qv",
+        type=float,
+        default=d.min_bar_qv_usd,
+        help=f"突破 K 線單根最低成交額 USD (預設 {d.min_bar_qv_usd:.0f})",
+    )
+    grp.add_argument(
+        "--tbr-min",
+        type=float,
+        default=d.tbr_min,
+        help=f"突破 K 線最低主動買盤比例 0~1 (預設 {d.tbr_min})",
+    )
+    grp.add_argument(
+        "--clv-min",
+        type=float,
+        default=d.clv_min,
+        help=f"突破 K 線最低收盤實體位置 CLV 0~1 (預設 {d.clv_min})",
+    )
+    grp.add_argument(
+        "--m1-bbw-max",
+        type=float,
+        default=d.m1_bbw_max_pct,
+        help=f"M1 蓄勢期 6h 布林帶寬上限 %% (預設 {d.m1_bbw_max_pct})",
+    )
+    grp.add_argument(
+        "--m1-rng24h-max",
+        type=float,
+        default=d.m1_rng24h_max_pct,
+        help=f"M1 24h 箱體振幅上限 %% (預設 {d.m1_rng24h_max_pct})",
+    )
+    grp.add_argument(
+        "--m1-vol-accel-min",
+        type=float,
+        default=d.m1_vol_accel_min,
+        help=f"M1 突破當根相對前一根成交額最低加速倍數 (預設 {d.m1_vol_accel_min})",
+    )
+    grp.add_argument(
+        "--m2-bbw-max",
+        type=float,
+        default=d.m2_bbw_max_pct,
+        help=f"M2 極致窒息 6h 布林帶寬上限 %% (預設 {d.m2_bbw_max_pct})",
+    )
+    grp.add_argument(
+        "--m2-rng6h-max",
+        type=float,
+        default=d.m2_rng6h_max_pct,
+        help=f"M2 極致窒息 6h 振幅上限 %% (預設 {d.m2_rng6h_max_pct})",
+    )
+    grp.add_argument(
+        "--m2-qv-mult-min",
+        type=float,
+        default=d.m2_qv_mult_min,
+        help=f"M2 巨量核爆成交額最低倍數 (預設 {d.m2_qv_mult_min})",
+    )
+
+
+def radar_config_from_args(args: argparse.Namespace) -> RadarConfig:
+    d = RadarConfig()
+    return RadarConfig(
+        breakout_buffer_pct=float(getattr(args, "breakout_buffer_pct", d.breakout_buffer_pct)),
+        qv_mult_min=float(getattr(args, "qv_mult_min", d.qv_mult_min)),
+        min_bar_qv_usd=float(getattr(args, "min_bar_qv", d.min_bar_qv_usd)),
+        tbr_min=float(getattr(args, "tbr_min", d.tbr_min)),
+        clv_min=float(getattr(args, "clv_min", d.clv_min)),
+        m1_bbw_max_pct=float(getattr(args, "m1_bbw_max", d.m1_bbw_max_pct)),
+        m1_rng24h_max_pct=float(getattr(args, "m1_rng24h_max", d.m1_rng24h_max_pct)),
+        m1_vol_accel_min=float(getattr(args, "m1_vol_accel_min", d.m1_vol_accel_min)),
+        m2_bbw_max_pct=float(getattr(args, "m2_bbw_max", d.m2_bbw_max_pct)),
+        m2_rng6h_max_pct=float(getattr(args, "m2_rng6h_max", d.m2_rng6h_max_pct)),
+        m2_qv_mult_min=float(getattr(args, "m2_qv_mult_min", d.m2_qv_mult_min)),
+    )
+
+
 def api_get(path: str, params: Optional[Dict[str, Any]] = None, retries: int = 3) -> Any:
     last_err: Optional[Exception] = None
     for attempt in range(retries):
@@ -203,10 +322,12 @@ def scan_squeeze_breakouts(
     *,
     sniper_only: bool = True,
     cooldown_bars: int = 12,
+    config: Optional[RadarConfig] = None,
 ) -> List[RadarHit]:
     """雙模狙擊偵測：M1 (VWAP 護盤蓄勢突破) + M2 (極致窒息巨量核爆)。"""
     if df.empty or len(df) < 260:
         return []
+    cfg = config or RadarConfig()
 
     o = df["Open"].to_numpy(float)
     h = df["High"].to_numpy(float)
@@ -225,6 +346,7 @@ def scan_squeeze_breakouts(
 
     hits: List[RadarHit] = []
     last_idx = -999
+    brk_mult = 1.0 + cfg.breakout_buffer_pct / 100.0
 
     for i in range(250, len(df)):
         if i - last_idx < cooldown_bars:
@@ -235,13 +357,13 @@ def scan_squeeze_breakouts(
             continue
 
         # 基礎突破與訂單流門檻
-        if c[i] <= don_h[i] * 1.004 or qvm[i] < 6.0 or qv[i] < 250_000 or tbr[i] < 0.52:
+        if c[i] <= don_h[i] * brk_mult or qvm[i] < cfg.qv_mult_min or qv[i] < cfg.min_bar_qv_usd or tbr[i] < cfg.tbr_min:
             continue
 
         clv = (c[i] - l[i]) / (h[i] - l[i])
         gain = (c[i] - o[i]) / o[i] * 100.0
         ext_vwap = (c[i] - vwap[i]) / vwap[i] * 100.0
-        if clv < 0.72 or gain < 2.2 or gain > 18.0 or ext_vwap > 14.0:
+        if clv < cfg.clv_min or gain < cfg.bar_gain_min_pct or gain > cfg.bar_gain_max_pct or ext_vwap > cfg.ext_vwap_max_pct:
             continue
 
         w_bbw = bbw[i - 26 : i - 2]
@@ -257,7 +379,7 @@ def scan_squeeze_breakouts(
         rng96 = (float(np.max(h[i - 98 : i - 2])) - float(np.min(l[i - 98 : i - 2]))) / float(np.min(l[i - 98 : i - 2])) * 100.0
 
         vwap_slp = (vwap[i - 2] - vwap[i - 26]) / vwap[i - 26] * 100.0
-        if b_max24 > 7.5 or rng24 > 7.5 or vwap_slp < 0.0:
+        if b_max24 > cfg.base_bbw_max_pct or rng24 > cfg.base_rng6h_max_pct or vwap_slp < 0.0:
             continue
 
         # 排除前 6 根內已有爆量長針洗盤
@@ -272,36 +394,32 @@ def scan_squeeze_breakouts(
         abv_vwap8 = int(np.sum(c[i - 8 : i] >= vwap[i - 8 : i]))
         tbr_p8 = float(np.nanmean(tbr[i - 8 : i])) * 100.0
         vol_acc = float(qv[i] / max(qv[i - 1], 1.0))
-        dist_s60 = (c[i - 1] - s60[i - 1]) / s60[i - 1] * 100.0
         dist_s480 = (c[i - 1] - s480[i - 1]) / s480[i - 1] * 100.0
         slp_s60 = (s60[i] - s60[i - 20]) / s60[i - 20] * 100.0
         slp_s200 = (s200[i] - s200[i - 20]) / s200[i - 20] * 100.0
 
-        # v3 全年去噪：排除 2.0%~3.7% 無力溫吞漂移帶（僅保留貼線底部起漲 ≤2.0% 或強勢空中旗形 ≥3.7%）
-        # 並要求蓄勢期前 8 根平均主動買盤具備承接底氣
         has_accum_flow = (
             (b_min10 >= 1.80 and (tbr_p8 >= 46.4 or qvm[i] >= 40.0))
-            or (0.90 <= b_min10 < 1.80 and tbr_p8 >= 48.0)
+            or (cfg.m1_bbw_min_low <= b_min10 < 1.80 and tbr_p8 >= 48.0)
         )
         is_m1 = (
             abv_vwap8 == 8
-            and 0.90 <= b_min10 <= 4.55
-            and b_max24 <= 6.90
+            and cfg.m1_bbw_min_low <= b_min10 <= cfg.m1_bbw_min_high
+            and b_max24 <= cfg.m1_bbw_max_pct
             and has_accum_flow
-            and rng96 <= 11.5
-            and rng48 <= 8.20
-            and -2.0 <= dist_s480 <= 12.0
-            and (dist_s60 <= 2.00 or dist_s60 >= 3.70)
-            and slp_s60 >= 0.52
-            and slp_s200 >= -0.10
-            and vol_acc >= 1.70
+            and rng96 <= cfg.m1_rng24h_max_pct
+            and rng48 <= cfg.m1_rng12h_max_pct
+            and cfg.m1_dist_s480_min_pct <= dist_s480 <= cfg.m1_dist_s480_max_pct
+            and slp_s60 >= cfg.m1_slp_s60_min_pct
+            and slp_s200 >= cfg.m1_slp_s200_min_pct
+            and vol_acc >= cfg.m1_vol_accel_min
         )
         is_m2 = (
-            b_max24 <= 2.20
-            and rng24 <= 3.00
-            and qvm[i] >= 30.0
-            and clv >= 0.90
-            and tbr[i] >= 0.54
+            b_max24 <= cfg.m2_bbw_max_pct
+            and rng24 <= cfg.m2_rng6h_max_pct
+            and qvm[i] >= cfg.m2_qv_mult_min
+            and clv >= cfg.m2_clv_min
+            and tbr[i] >= cfg.m2_tbr_min
         )
 
         if sniper_only and not (is_m1 or is_m2):
@@ -310,7 +428,7 @@ def scan_squeeze_breakouts(
         mode = "ULTRA_SQUEEZE_CLIMAX" if is_m2 else "VWAP_COIL_BREAK"
         stop_price = min(l[i], lo24) * 0.995
         risk = c[i] - stop_price
-        if risk <= 0 or (risk / c[i] * 100.0) < 0.8 or (risk / c[i] * 100.0) > 14.0:
+        if risk <= 0 or (risk / c[i] * 100.0) < cfg.min_risk_pct or (risk / c[i] * 100.0) > cfg.max_risk_pct:
             continue
 
         future_high = float(np.max(h[i + 1 :])) if (i + 1) < len(h) else float(c[i])
@@ -508,13 +626,14 @@ def run_radar(
     sniper_only: bool = True,
     plot_dir: Optional[Path] = None,
     drop_forming: bool = True,
+    config: Optional[RadarConfig] = None,
 ) -> List[RadarHit]:
     hits: List[RadarHit] = []
 
     def _scan_one(sym: str) -> List[RadarHit]:
         try:
             df = load_klines_with_orderflow(sym, interval=interval, limit=limit, drop_forming=drop_forming)
-            res = scan_squeeze_breakouts(df, sym, interval=interval, sniper_only=sniper_only)
+            res = scan_squeeze_breakouts(df, sym, interval=interval, sniper_only=sniper_only, config=config)
             if not res:
                 return []
             if recent_bars > 0:
@@ -580,12 +699,14 @@ def main() -> int:
     parser.add_argument("--recent-bars", type=int, default=10, help="掃描模式顯示最近 N 根內的新起漲訊號")
     parser.add_argument("--plot", action="store_true", help="輸出深色主題三合一雷達圖 PNG")
     parser.add_argument("--include-forming", action="store_true", help="納入尚未收盤的當根 K 線（預設僅掃描已收盤 K 線避免重繪）")
-    parser.add_argument("--out-dir", type=str, default="breakout_output", help="圖表輸出資料夾")
+    parser.add_argument("--out-dir", type=str, default="breakout_output", help="圖表輸出資料夾 (預設 breakout_output)")
+    add_radar_threshold_args(parser)
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     sniper_only = not args.relaxed
     drop_forming = not args.include_forming
+    cfg = radar_config_from_args(args)
 
     if args.symbols:
         syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -598,6 +719,7 @@ def main() -> int:
             sniper_only=sniper_only,
             plot_dir=out_dir if args.plot else None,
             drop_forming=drop_forming,
+            config=cfg,
         )
         print_hits(hits)
         if args.plot and hits:
@@ -621,6 +743,7 @@ def main() -> int:
             sniper_only=sniper_only,
             plot_dir=out_dir if args.plot else None,
             drop_forming=drop_forming,
+            config=cfg,
         )
 
         if args.watch > 0:

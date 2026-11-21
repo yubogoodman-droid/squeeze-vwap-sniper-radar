@@ -686,7 +686,7 @@ def _position_mtm_pnl_at(pos: Dict[str, Any], eval_ms: int) -> Tuple[float, floa
         if idx < len(times_ms) and int(times_ms[idx]) == eval_ms:
             px_low = float(troughs[idx])
             px_close = float(closes[idx])
-            if pos["liquidated"] and px_low <= pos["liq_price"]:
+            if pos["liquidated"] and (px_low <= pos["liq_price"] or eval_ms >= pos["exit_ms"]):
                 pos["liq_triggered"] = True
                 pos["last_u_close"] = -margin
                 return -margin, -margin

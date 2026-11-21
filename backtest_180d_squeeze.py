@@ -217,7 +217,15 @@ class SimTrade:
     exit_reason_trend: str
     max_fav_pct: float
     hold_bars: int
+    funding_cost_pct: float = 0.0
+    funding_source: str = "est"
+    roundtrip_cost_pct: float = FEE_ROUNDTRIP_PCT
     worst_low_price: float = 0.0
+    bar_quote_vol_usd: float = 0.0
+    trailing_24h_qv_usd: float = 0.0
+    mtm_times_ms: Optional[np.ndarray] = None
+    mtm_trough_prices: Optional[np.ndarray] = None
+    mtm_close_prices: Optional[np.ndarray] = None
     exit_3r_idx: int = 0
     is_oos: bool = False
     card_rel_path: str = ""
@@ -230,8 +238,11 @@ def simulate_trade(
     max_hold_bars: int = 160,
     breakeven_arm_r: float = BREAKEVEN_ARM_R,
     breakeven_buffer_pct: float = BREAKEVEN_BUFFER_PCT,
+    roundtrip_cost_pct: float = FEE_ROUNDTRIP_PCT,
+    funding_store: Optional[bt_utils.FundingRateStore] = None,
+    trailing_24h_qv_usd: float = 0.0,
 ) -> Optional[SimTrade]:
-    """從訊號收盤價進場，模擬抗回踩趨勢追蹤出場（+0.55R 保本鎖定並同根保守檢查低點 + 跌破 BB 中軌止盈，跳空按 min(open, stop) 成交）。"""
+    """從訊號收盤價進場，模擬抗回踩趨勢追蹤出場（+0.55R 保本鎖定並同根保守檢查低點 + 跌破 BB 中軌止盈，扣費滑與資金費率）。"""
     i0 = hit.bar_idx
     if i0 >= len(df) - 2:
         return None
@@ -251,6 +262,7 @@ def simulate_trade(
     closes = df["Close"].to_numpy(float)
     bb_mid = df["BB_MID"].to_numpy(float)
     times = df.index
+    bar_ms = radar.INTERVAL_MS.get(hit.interval, 900_000)
 
     end_i = min(len(df) - 1, i0 + max_hold_bars)
     max_fav = float(np.max(highs[i0 + 1 : end_i + 1]) - entry) / entry * 100.0 if end_i > i0 else 0.0
@@ -268,7 +280,12 @@ def simulate_trade(
             exit_3r = float(target_3r)
             exit_3r_idx = k
             break
-    pnl_3r = (exit_3r - entry) / entry * 100.0 - FEE_ROUNDTRIP_PCT
+    fc_3r = 0.0
+    if funding_store is not None:
+        fc_3r, _, _ = funding_store.compute_funding_cost_pct(
+            hit.symbol, bt_utils.ts_to_ms(times[i0]), bt_utils.ts_to_ms(times[exit_3r_idx]), bar_ms=bar_ms
+        )
+    pnl_3r = (exit_3r - entry) / entry * 100.0 - roundtrip_cost_pct - fc_3r
     r_3r = pnl_3r / risk_pct
 
     # 2) 主戰策略：抗回踩趨勢追蹤（同根上移保本止損後立即保守檢查當根低點；跳空以 min(open, stop) 成交；收盤破中軌按實際收盤價出場）
@@ -300,8 +317,25 @@ def simulate_trade(
             reason = "跌破BB中軌止盈"
             break
 
-    pnl_trend = (exit_px - entry) / entry * 100.0 - FEE_ROUNDTRIP_PCT
+    funding_cost_pct = 0.0
+    funding_source = "none"
+    if funding_store is not None:
+        funding_cost_pct, _, funding_source = funding_store.compute_funding_cost_pct(
+            hit.symbol, bt_utils.ts_to_ms(times[i0]), bt_utils.ts_to_ms(times[exit_idx]), bar_ms=bar_ms
+        )
+
+    pnl_trend = (exit_px - entry) / entry * 100.0 - roundtrip_cost_pct - funding_cost_pct
     r_trend = pnl_trend / risk_pct
+
+    sl = slice(i0 + 1, exit_idx + 1)
+    idx_utc = pd.DatetimeIndex(times[sl]).tz_convert("UTC")
+    mtm_times_ms = np.asarray(idx_utc.as_unit("ms").asi8, dtype=np.int64)
+    mtm_troughs = np.minimum(lows[sl], opens[sl]).astype(np.float64, copy=True)
+    mtm_closes = closes[sl].astype(np.float64, copy=True)
+    if len(mtm_troughs) > 0:
+        if reason in ("初始止損", "保本止盈"):
+            mtm_troughs[-1] = float(exit_px)
+        mtm_closes[-1] = float(exit_px)
 
     return SimTrade(
         symbol=hit.symbol,
@@ -329,7 +363,15 @@ def simulate_trade(
         exit_reason_trend=reason,
         max_fav_pct=max_fav,
         hold_bars=exit_idx - i0,
+        funding_cost_pct=funding_cost_pct,
+        funding_source=funding_source,
+        roundtrip_cost_pct=roundtrip_cost_pct,
         worst_low_price=worst_low,
+        bar_quote_vol_usd=float(hit.quote_vol_usd),
+        trailing_24h_qv_usd=float(trailing_24h_qv_usd),
+        mtm_times_ms=mtm_times_ms,
+        mtm_trough_prices=mtm_troughs,
+        mtm_close_prices=mtm_closes,
         exit_3r_idx=exit_3r_idx,
         hit=hit,
     )
@@ -569,7 +611,7 @@ def render_trade_cards(
         tr.card_rel_path = f"cards/{fname}"
 
 
-def _to_basic_portfolio_inputs(trades: Sequence[SimTrade]) -> List[bt_utils.PortfolioTradeInput]:
+def _to_portfolio_inputs(trades: Sequence[SimTrade]) -> List[bt_utils.PortfolioTradeInput]:
     return [
         bt_utils.PortfolioTradeInput(
             symbol=t.symbol,
@@ -581,8 +623,15 @@ def _to_basic_portfolio_inputs(trades: Sequence[SimTrade]) -> List[bt_utils.Port
             risk_pct=t.risk_pct,
             net_pnl_pct=t.pnl_trend,
             r_mult=t.r_trend,
-            worst_low_price=min(t.entry_price, t.exit_price_trend),
+            worst_low_price=t.worst_low_price if t.worst_low_price > 0 else min(t.entry_price, t.exit_price_trend),
+            bar_quote_vol_usd=t.bar_quote_vol_usd,
+            trailing_24h_qv_usd=t.trailing_24h_qv_usd,
+            funding_cost_pct=t.funding_cost_pct,
+            roundtrip_cost_pct=t.roundtrip_cost_pct,
             priority=float(t.score) * 1000.0 + float(t.qv_mult),
+            mtm_times_ms=t.mtm_times_ms,
+            mtm_trough_prices=t.mtm_trough_prices,
+            mtm_close_prices=t.mtm_close_prices,
             payload=t,
         )
         for t in trades
@@ -597,6 +646,8 @@ def write_html_report(
     n_syms: int,
     eq_filename: str = "equity_curve_180d.png",
     oos_report: Optional[Dict[str, Any]] = None,
+    sens_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    base_cost_pct: float = FEE_ROUNDTRIP_PCT,
 ) -> Path:
     m1_list = [t for t in trades if t.mode == "VWAP_COIL_BREAK"]
     m2_list = [t for t in trades if t.mode == "ULTRA_SQUEEZE_CLIMAX"]
@@ -640,7 +691,7 @@ def write_html_report(
               </div>
               <div class="card-meta">
                 進場: <b>{t.entry_price:.6g}</b> ｜ 初始止損: <b>{t.stop_price:.6g}</b> (風險 {t.risk_pct:.1f}%) ｜
-                出場: <b>{t.exit_price_trend:.6g}</b> ({escape(t.exit_reason_trend)}){bal_str}
+                出場: <b>{t.exit_price_trend:.6g}</b> ({escape(t.exit_reason_trend)}) ｜ 資金費率: <b>{t.funding_cost_pct:+.2f}%</b>{bal_str}
               </div>
               <div class="card-note">{escape(t.note)}</div>
               {img_block}
@@ -661,7 +712,7 @@ def write_html_report(
             f"<td>{t.entry_price:.6g}</td><td>{t.stop_price:.6g} (-{t.risk_pct:.1f}%)</td>"
             f"<td>{t.bbw_min10_pct:.1f}%~{t.bbw_max24_pct:.1f}%</td>"
             f"<td>{t.qv_mult:.1f}x</td><td>{t.taker_buy_pct:.1f}%</td>"
-            f"<td>+{t.max_fav_pct:.1f}%</td>"
+            f"<td>{t.funding_cost_pct:+.2f}%</td>"
             f"<td class='{cls}'>{t.pnl_trend:+.2f}% ({t.r_trend:+.2f}R)</td>"
             f"<td>{t.pnl_fixed3r:+.2f}%</td>"
             f"<td>{escape(t.exit_reason_trend)}</td></tr>"
@@ -669,7 +720,13 @@ def write_html_report(
 
     m1_top = "、".join(f"{t.symbol.replace('USDT','')} ({t.pnl_trend:+.0f}%)" for t in sorted(m1_list, key=lambda x: x.pnl_trend, reverse=True)[:4]) or "-"
     m2_top = "、".join(f"{t.symbol.replace('USDT','')} ({t.pnl_trend:+.0f}%)" for t in sorted(m2_list, key=lambda x: x.pnl_trend, reverse=True)[:4]) or "-"
-    oos_section_html = bt_utils.render_oos_walkforward_html(oos_report) if oos_report else ""
+    risk_pct_lbl = float(port.get("risk_pct_per_trade", 2.0))
+    oos_section_html = bt_utils.render_oos_walkforward_html(oos_report, risk_pct=risk_pct_lbl) if oos_report else ""
+    sens_section_html = (
+        bt_utils.render_cost_sensitivity_html(sens_rows, base_cost_pct=base_cost_pct, risk_pct=risk_pct_lbl)
+        if sens_rows
+        else ""
+    )
 
     html = f"""<!doctype html>
 <html lang="zh-Hant">
@@ -728,6 +785,7 @@ def write_html_report(
   </div>
 
   {oos_section_html}
+  {sens_section_html}
 
   <h2>⚡ 雙模分項表現對照（極致提純去噪後表現）</h2>
   <div class="table-wrap">
@@ -787,7 +845,7 @@ def write_html_report(
       <thead>
         <tr>
           <th>進場時間 (TPE)</th><th>幣種</th><th>區間</th><th>模式</th><th>進場價</th><th>止損 (風險)</th>
-          <th>壓縮BBW</th><th>成交額倍數</th><th>主動買盤</th><th>後續最高</th>
+          <th>壓縮BBW</th><th>成交額倍數</th><th>主動買盤</th><th>資金費率成本</th>
           <th>趨勢追蹤淨利</th><th>對照固定3R</th><th>出場原因</th>
         </tr>
       </thead>
@@ -828,6 +886,27 @@ def main() -> int:
         help=f"保本止損高於進場價之緩衝 %% (預設 {BREAKEVEN_BUFFER_PCT})",
     )
     parser.add_argument("--max-hold-bars", type=int, default=160, help="最長持有 K 線根數 (預設 160)")
+    parser.add_argument(
+        "--fee-pct",
+        "--roundtrip-cost-pct",
+        dest="fee_pct",
+        type=float,
+        default=FEE_ROUNDTRIP_PCT,
+        help=f"雙邊手續費+滑價總成本 %% (預設 {FEE_ROUNDTRIP_PCT}%%；報告同時輸出 0.12%%/0.30%%/0.50%% 敏感度對照)",
+    )
+    parser.add_argument(
+        "--sensitivity-costs",
+        type=str,
+        default="0.12,0.30,0.50",
+        help="成本敏感度測試之雙邊費滑 %% 清單，逗號分隔 (預設 0.12,0.30,0.50)",
+    )
+    parser.add_argument(
+        "--funding-rate-8h",
+        type=float,
+        default=0.03,
+        help="無法抓取歷史費率時每 8h 結算之保守估計資金費率 %% (預設 0.03)",
+    )
+    parser.add_argument("--no-fetch-funding", action="store_true", help="不連網抓取歷史資金費率，直接使用保守估計值")
     parser.add_argument("--oos-date", type=str, default="", help="樣本外盲測切分日期 YYYY-MM-DD (預設依 --oos-ratio 自動切分)")
     parser.add_argument("--oos-ratio", type=float, default=0.30, help="樣本外盲測時間佔比 (預設 0.30 = 後 30%% 為 OOS)")
     parser.add_argument("--wf-folds", type=int, default=4, help="Walk-Forward 時間切片期數 (預設 4)")
@@ -896,6 +975,13 @@ def main() -> int:
         return 0
 
     pit_index = bt_utils.PointInTimeVolumeIndex(all_dfs)
+    funding_store = bt_utils.FundingRateStore(
+        cache_dir=cache_dir,
+        fallback_rate_8h_pct=args.funding_rate_8h,
+        fetch_online=not args.no_fetch_funding,
+        session=radar.HTTP,
+        base_url=radar.BINANCE_FAPI,
+    )
     all_trades: List[SimTrade] = []
     dfs_with_hits: Dict[str, pd.DataFrame] = {}
     min_ts = min(df.index[0] for df in all_dfs.values())
@@ -908,7 +994,7 @@ def main() -> int:
         for h in hits:
             if h.timestamp < eval_start:
                 continue
-            ok_vol, _qv24, _ = pit_index.check_eligibility(
+            ok_vol, qv24, _ = pit_index.check_eligibility(
                 sym, h.timestamp, min_quote_vol=args.min_vol, top_n=args.top
             )
             if not ok_vol:
@@ -919,6 +1005,9 @@ def main() -> int:
                 max_hold_bars=args.max_hold_bars,
                 breakeven_arm_r=args.breakeven_r,
                 breakeven_buffer_pct=args.breakeven_buffer_pct,
+                roundtrip_cost_pct=args.fee_pct,
+                funding_store=funding_store,
+                trailing_24h_qv_usd=qv24,
             )
             if tr is not None:
                 sym_trades.append(tr)
@@ -931,8 +1020,9 @@ def main() -> int:
         print("回測期間內無符合條件之交易。")
         return 0
 
+    port_inputs = _to_portfolio_inputs(all_trades)
     oos_report = bt_utils.compute_oos_and_walkforward(
-        _to_basic_portfolio_inputs(all_trades),
+        port_inputs,
         window_start=eval_start,
         window_end=max_ts.to_pydatetime(),
         oos_split_date=args.oos_date,
@@ -940,6 +1030,10 @@ def main() -> int:
         wf_folds=args.wf_folds,
         initial_cap=1000.0,
     )
+    sens_levels = [float(x.strip()) for x in args.sensitivity_costs.split(",") if x.strip()]
+    if round(args.fee_pct, 4) not in [round(x, 4) for x in sens_levels]:
+        sens_levels = sorted(sens_levels + [args.fee_pct])
+    sens_rows = bt_utils.compute_cost_sensitivity(port_inputs, cost_levels_pct=sens_levels, initial_cap=1000.0)
     split_ts = oos_report["split_ts"]
     for t in all_trades:
         t.is_oos = pd.Timestamp(t.entry_time) >= split_ts
@@ -967,13 +1061,23 @@ def main() -> int:
         f"總R {oos_st['sum_r']:+.1f}R | PF {bt_utils.fmt_pf(oos_st['pf'])} | 2%定倉 ${oos_st['risk_eq']:,.0f}"
     )
     print("-" * 105)
+    print("💸 成本敏感度對照 (雙邊手續費+滑價 + 資金費率)：")
+    for srow in sens_rows:
+        cst = srow["stats"]
+        print(
+            f"  費滑 {srow['cost_pct']:.2f}% | 勝率 {cst['win_rate']:5.1f}% ({cst['wins']}/{cst['n']}) | "
+            f"平均 {cst['avg_r']:+.2f}R / 總 {cst['sum_r']:+.1f}R | PF {bt_utils.fmt_pf(cst['pf'])} | "
+            f"2%定倉 ${cst['risk_eq']:,.2f} ({cst['risk_ret_pct']:+.1f}%, MTM MDD -{cst['risk_mdd_pct']:.1f}%) | "
+            f"1x複利 ${cst['spot_eq']:,.2f}"
+        )
+    print("-" * 105)
     print("📋 全數交易明細：")
     for t in all_trades:
         m_tag = "M2" if t.mode == "ULTRA_SQUEEZE_CLIMAX" else "M1"
         split_tag = "OOS" if t.is_oos else "IS "
         print(
             f"  {t.entry_time.strftime('%Y-%m-%d %H:%M')} | {split_tag} | {t.symbol:<12} | {m_tag} | 進:{t.entry_price:<9.5g} | "
-            f"1x:{t.pnl_trend:+6.1f}% ({t.r_trend:+5.2f}R) | 最高:+{t.max_fav_pct:5.1f}% | {t.exit_reason_trend}"
+            f"1x:{t.pnl_trend:+6.1f}% ({t.r_trend:+5.2f}R, 費率:{t.funding_cost_pct:+.2f}%) | 最高:+{t.max_fav_pct:5.1f}% | {t.exit_reason_trend}"
         )
     print("=" * 105)
 
@@ -982,7 +1086,17 @@ def main() -> int:
     if not args.skip_cards:
         render_trade_cards(all_trades, dfs_with_hits, out_dir / "cards")
     plot_equity_curves(all_trades, port, out_dir / eq_filename, args.days, len(all_dfs))
-    report = write_html_report(all_trades, port, out_dir, args.days, len(all_dfs), eq_filename=eq_filename, oos_report=oos_report)
+    report = write_html_report(
+        all_trades,
+        port,
+        out_dir,
+        args.days,
+        len(all_dfs),
+        eq_filename=eq_filename,
+        oos_report=oos_report,
+        sens_rows=sens_rows,
+        base_cost_pct=args.fee_pct,
+    )
     print(f"\n[圖表與報告已產出] {report.resolve()}")
     return 0
 

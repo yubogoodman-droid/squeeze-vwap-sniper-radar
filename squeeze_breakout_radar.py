@@ -18,8 +18,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import logging
+import os
 from pathlib import Path
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from zoneinfo import ZoneInfo
@@ -32,17 +35,92 @@ import numpy as np
 import pandas as pd
 import requests
 
+logger = logging.getLogger("squeeze_breakout_radar")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.WARNING)
+
 TPE = ZoneInfo("Asia/Taipei")
 BINANCE_FAPI = "https://fapi.binance.com"
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+_RATE_LOCK = threading.Lock()
+_COOLDOWN_UNTIL = 0.0
 
 INTERVAL_MS = {
+    "1m": 60_000,
+    "3m": 180_000,
     "5m": 300_000,
     "15m": 900_000,
     "30m": 1_800_000,
     "1h": 3_600_000,
+    "2h": 7_200_000,
+    "4h": 14_400_000,
 }
+
+
+def interval_to_ms(interval: str) -> int:
+    iv = interval.strip().lower()
+    if iv in INTERVAL_MS:
+        return INTERVAL_MS[iv]
+    if iv.endswith("m") and iv[:-1].isdigit():
+        return int(iv[:-1]) * 60_000
+    if iv.endswith("h") and iv[:-1].isdigit():
+        return int(iv[:-1]) * 3_600_000
+    if iv.endswith("d") and iv[:-1].isdigit():
+        return int(iv[:-1]) * 86_400_000
+    return 900_000
+
+
+def timeframe_windows(interval: str = "15m") -> Dict[str, int]:
+    """Scale physical lookback durations from bar_ms instead of hardcoding 15m bar counts."""
+    bar_ms = interval_to_ms(interval)
+    scale = 900_000.0 / float(max(bar_ms, 60_000))
+    bars_24h = max(6, int(round(96.0 * scale)))
+    bars_12h = max(4, int(round(48.0 * scale)))
+    bars_6h = max(3, int(round(24.0 * scale)))
+    bars_bbw_min = max(2, int(round(10.0 * scale)))
+    pre_buf = max(1, int(round(2.0 * scale)))
+    bars_vwap_hold = max(2, int(round(8.0 * scale)))
+    bars_wick = max(2, int(round(6.0 * scale)))
+    sma_fast = max(10, int(round(60.0 * scale)))
+    sma_mid = max(20, int(round(200.0 * scale)))
+    sma_5d = max(48, int(round(480.0 * scale)))
+    sma_5d_min_p = max(24, sma_5d // 2)
+    slope_bars = max(3, int(round(20.0 * scale)))
+    qv_med_bars = max(8, int(round(20.0 * scale)))
+    cooldown_bars = max(2, int(round(12.0 * scale)))
+    max_hold_bars = max(16, int(round(160.0 * scale)))
+
+    warmup_bars = max(
+        sma_mid + slope_bars,
+        sma_5d_min_p + 2,
+        bars_24h + pre_buf + 2,
+        250 if bar_ms == 900_000 else 40,
+    )
+    min_df_len = warmup_bars + 10
+    return {
+        "bar_ms": bar_ms,
+        "bars_24h": bars_24h,
+        "bars_12h": bars_12h,
+        "bars_6h": bars_6h,
+        "bars_bbw_min": bars_bbw_min,
+        "pre_buf": pre_buf,
+        "bars_vwap_hold": bars_vwap_hold,
+        "bars_wick": bars_wick,
+        "sma_fast": sma_fast,
+        "sma_mid": sma_mid,
+        "sma_5d": sma_5d,
+        "sma_5d_min_p": sma_5d_min_p,
+        "slope_bars": slope_bars,
+        "qv_med_bars": qv_med_bars,
+        "cooldown_bars": cooldown_bars,
+        "max_hold_bars": max_hold_bars,
+        "warmup_bars": warmup_bars,
+        "min_df_len": min_df_len,
+    }
 
 BLACKLIST = frozenset({
     "USDCUSDT", "FDUSDUSDT", "USDEUSDT", "TUSDUSDT",
@@ -201,19 +279,53 @@ def radar_config_from_args(args: argparse.Namespace) -> RadarConfig:
     )
 
 
-def api_get(path: str, params: Optional[Dict[str, Any]] = None, retries: int = 3) -> Any:
+def api_get(path: str, params: Optional[Dict[str, Any]] = None, retries: int = 4) -> Any:
+    global _COOLDOWN_UNTIL
     last_err: Optional[Exception] = None
     for attempt in range(retries):
+        wait_cd = 0.0
+        with _RATE_LOCK:
+            now_m = time.monotonic()
+            if _COOLDOWN_UNTIL > now_m:
+                wait_cd = _COOLDOWN_UNTIL - now_m
+        if wait_cd > 0:
+            time.sleep(wait_cd)
         try:
             resp = HTTP.get(BINANCE_FAPI + path, params=params, timeout=15)
+            used_w = resp.headers.get("X-MBX-USED-WEIGHT-1M")
+            if used_w and used_w.isdigit() and int(used_w) >= 1950:
+                with _RATE_LOCK:
+                    _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, time.monotonic() + 10.0)
             if resp.status_code in (418, 429):
-                time.sleep(1.2 * (attempt + 1))
+                retry_hdr = resp.headers.get("Retry-After")
+                wait_s = float(retry_hdr) if (retry_hdr and retry_hdr.isdigit()) else 2.0 * (2 ** attempt)
+                with _RATE_LOCK:
+                    _COOLDOWN_UNTIL = max(_COOLDOWN_UNTIL, time.monotonic() + wait_s)
+                logger.warning(
+                    "Binance API 觸發限流 (HTTP %s, %s)，等待 %.1fs 後重試 (%d/%d)",
+                    resp.status_code,
+                    path,
+                    wait_s,
+                    attempt + 1,
+                    retries,
+                )
+                time.sleep(wait_s)
                 continue
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:
             last_err = exc
-            time.sleep(0.35 * (attempt + 1))
+            wait_s = 0.5 * (2 ** attempt)
+            if attempt + 1 < retries:
+                logger.warning(
+                    "Binance API 請求失敗 (%s): %s，%.1fs 後重試 (%d/%d)",
+                    path,
+                    exc,
+                    wait_s,
+                    attempt + 1,
+                    retries,
+                )
+                time.sleep(wait_s)
     raise RuntimeError(f"Binance API failed ({path}): {last_err}")
 
 
@@ -246,6 +358,7 @@ def list_usdt_perps(min_quote_vol_usd: float = 1_500_000, max_symbols: int = 260
 
 
 def compute_radar_indicators(df: pd.DataFrame, interval: str = "15m") -> pd.DataFrame:
+    tf = timeframe_windows(interval)
     mid = df["Close"].rolling(20, min_periods=20).mean()
     std = df["Close"].rolling(20, min_periods=20).std()
     df["BB_MID"] = mid
@@ -253,9 +366,13 @@ def compute_radar_indicators(df: pd.DataFrame, interval: str = "15m") -> pd.Data
     df["BB_LOWER"] = mid - 2.0 * std
     df["BBW"] = np.where(mid > 0, (4.0 * std) / mid * 100.0, np.nan)
 
-    df["SMA60"] = df["Close"].rolling(60, min_periods=60).mean()
-    df["SMA200"] = df["Close"].rolling(200, min_periods=200).mean()
-    df["SMA480"] = df["Close"].rolling(480, min_periods=240).mean()
+    sma_fast = tf["sma_fast"]
+    sma_mid = tf["sma_mid"]
+    sma_5d = tf["sma_5d"]
+    sma_5d_min_p = tf["sma_5d_min_p"]
+    df["SMA60"] = df["Close"].rolling(sma_fast, min_periods=sma_fast).mean()
+    df["SMA200"] = df["Close"].rolling(sma_mid, min_periods=sma_mid).mean()
+    df["SMA480"] = df["Close"].rolling(sma_5d, min_periods=sma_5d_min_p).mean()
 
     prev_c = df["Close"].shift(1)
     tr = pd.concat(
@@ -264,17 +381,18 @@ def compute_radar_indicators(df: pd.DataFrame, interval: str = "15m") -> pd.Data
     ).max(axis=1)
     df["ATR_PCT"] = (tr.rolling(14, min_periods=14).mean() / df["Close"]) * 100.0
 
-    bar_ms = INTERVAL_MS.get(interval, 900_000)
-    bars_24h = max(24, min(144, int(86_400_000 // bar_ms)))
-    bars_12h = max(12, bars_24h // 2)
+    bars_24h = tf["bars_24h"]
+    bars_12h = tf["bars_12h"]
+    min_p_12h = min(bars_12h, max(4, bars_12h // 2))
     df["DON_HIGH"] = df["High"].rolling(bars_24h, min_periods=bars_12h).max().shift(1)
-    df["DON_LOW"] = df["Low"].rolling(bars_12h, min_periods=12).min().shift(1)
+    df["DON_LOW"] = df["Low"].rolling(bars_12h, min_periods=min_p_12h).min().shift(1)
 
-    vol_sum = df["Volume"].rolling(bars_12h, min_periods=12).sum()
-    qv_sum = df["QuoteVol"].rolling(bars_12h, min_periods=12).sum()
+    vol_sum = df["Volume"].rolling(bars_12h, min_periods=min_p_12h).sum()
+    qv_sum = df["QuoteVol"].rolling(bars_12h, min_periods=min_p_12h).sum()
     df["VWAP"] = np.where(vol_sum > 0, qv_sum / vol_sum, np.nan)
 
-    qv_med = df["QuoteVol"].shift(1).rolling(20, min_periods=10).median()
+    qv_win = tf["qv_med_bars"]
+    qv_med = df["QuoteVol"].shift(1).rolling(qv_win, min_periods=max(4, qv_win // 2)).median()
     df["QV_MULT"] = np.where(qv_med > 0, df["QuoteVol"] / qv_med, np.nan)
     df["TBR"] = np.where(df["Volume"] > 0, df["TakerBuyVol"] / df["Volume"], np.nan)
     return df
@@ -286,8 +404,10 @@ def load_klines_with_orderflow(
     limit: int = 560,
     drop_forming: bool = True,
 ) -> pd.DataFrame:
-    bar_ms = INTERVAL_MS.get(interval, 900_000)
-    req_limit = min(1500, limit + (1 if drop_forming else 0))
+    tf = timeframe_windows(interval)
+    bar_ms = tf["bar_ms"]
+    eff_limit = max(limit, tf["min_df_len"] + 40) if limit == 560 else limit
+    req_limit = min(1500, eff_limit + (1 if drop_forming else 0))
     raw = api_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": req_limit})
     if not raw:
         return pd.DataFrame()
@@ -296,7 +416,7 @@ def load_klines_with_orderflow(
     while drop_forming and raw and int(raw[-1][0]) + bar_ms > now_ms:
         raw = raw[:-1]
 
-    if len(raw) < 260:
+    if len(raw) < tf["min_df_len"]:
         return pd.DataFrame()
 
     df = pd.DataFrame(
@@ -321,13 +441,23 @@ def scan_squeeze_breakouts(
     interval: str = "15m",
     *,
     sniper_only: bool = True,
-    cooldown_bars: int = 12,
+    cooldown_bars: Optional[int] = None,
     config: Optional[RadarConfig] = None,
 ) -> List[RadarHit]:
-    """雙模狙擊偵測：M1 (VWAP 護盤蓄勢突破) + M2 (極致窒息巨量核爆)。"""
-    if df.empty or len(df) < 260:
+    """雙模狙擊偵測：M1 (VWAP 護盤蓄勢突破) + M2 (極致窒息巨量核爆)，視窗隨 K 線時長自動縮放。"""
+    tf = timeframe_windows(interval)
+    if df.empty or len(df) < tf["min_df_len"]:
         return []
     cfg = config or RadarConfig()
+    cd_bars = tf["cooldown_bars"] if cooldown_bars is None else int(cooldown_bars)
+    b6 = tf["bars_6h"]
+    b12 = tf["bars_12h"]
+    b24 = tf["bars_24h"]
+    b_min_win = tf["bars_bbw_min"]
+    pre_buf = tf["pre_buf"]
+    vh_win = tf["bars_vwap_hold"]
+    wick_win = tf["bars_wick"]
+    slp_win = tf["slope_bars"]
 
     o = df["Open"].to_numpy(float)
     h = df["High"].to_numpy(float)
@@ -347,13 +477,32 @@ def scan_squeeze_breakouts(
     hits: List[RadarHit] = []
     last_idx = -999
     brk_mult = 1.0 + cfg.breakout_buffer_pct / 100.0
+    w6_lookback = b6 + pre_buf
+    w12_lookback = b12 + pre_buf
+    w24_lookback = b24 + pre_buf
 
-    for i in range(250, len(df)):
-        if i - last_idx < cooldown_bars:
+    for i in range(tf["warmup_bars"], len(df)):
+        if i - last_idx < cd_bars:
             continue
         if c[i] <= o[i] or o[i] <= 0 or h[i] <= l[i]:
             continue
-        if not np.isfinite([bbw[i], don_h[i], vwap[i], qvm[i], tbr[i], vwap[i - 26], s60[i], s200[i], s480[i - 1]]).all():
+        if i < w24_lookback or i < slp_win:
+            continue
+        if not np.isfinite(
+            [
+                bbw[i],
+                don_h[i],
+                vwap[i],
+                qvm[i],
+                tbr[i],
+                vwap[i - w6_lookback],
+                s60[i],
+                s200[i],
+                s480[i - 1],
+                s60[i - slp_win],
+                s200[i - slp_win],
+            ]
+        ).all():
             continue
 
         # 基礎突破與訂單流門檻
@@ -366,44 +515,46 @@ def scan_squeeze_breakouts(
         if clv < cfg.clv_min or gain < cfg.bar_gain_min_pct or gain > cfg.bar_gain_max_pct or ext_vwap > cfg.ext_vwap_max_pct:
             continue
 
-        w_bbw = bbw[i - 26 : i - 2]
-        if not np.isfinite(w_bbw).all():
+        w_bbw = bbw[i - w6_lookback : i - pre_buf]
+        if len(w_bbw) == 0 or not np.isfinite(w_bbw).all():
             continue
         b_max24 = float(np.max(w_bbw))
-        b_min10 = float(np.nanmin(bbw[i - 10 : i]))
+        b_min10 = float(np.nanmin(bbw[i - b_min_win : i]))
 
-        hi24 = float(np.max(h[i - 26 : i - 2]))
-        lo24 = float(np.min(l[i - 26 : i - 2]))
+        hi24 = float(np.max(h[i - w6_lookback : i - pre_buf]))
+        lo24 = float(np.min(l[i - w6_lookback : i - pre_buf]))
         rng24 = (hi24 - lo24) / lo24 * 100.0
-        rng48 = (float(np.max(h[i - 50 : i - 2])) - float(np.min(l[i - 50 : i - 2]))) / float(np.min(l[i - 50 : i - 2])) * 100.0
-        rng96 = (float(np.max(h[i - 98 : i - 2])) - float(np.min(l[i - 98 : i - 2]))) / float(np.min(l[i - 98 : i - 2])) * 100.0
+        lo48 = float(np.min(l[i - w12_lookback : i - pre_buf]))
+        rng48 = (float(np.max(h[i - w12_lookback : i - pre_buf])) - lo48) / lo48 * 100.0
+        lo96 = float(np.min(l[i - w24_lookback : i - pre_buf]))
+        rng96 = (float(np.max(h[i - w24_lookback : i - pre_buf])) - lo96) / lo96 * 100.0
 
-        vwap_slp = (vwap[i - 2] - vwap[i - 26]) / vwap[i - 26] * 100.0
+        vwap_slp = (vwap[i - pre_buf] - vwap[i - w6_lookback]) / vwap[i - w6_lookback] * 100.0
         if b_max24 > cfg.base_bbw_max_pct or rng24 > cfg.base_rng6h_max_pct or vwap_slp < 0.0:
             continue
 
-        # 排除前 6 根內已有爆量長針洗盤
+        # 排除前 1.5h 內已有爆量長針洗盤
         had_wick = False
-        for k in range(i - 6, i):
+        for k in range(i - wick_win, i):
             if l[k] > 0 and (h[k] - l[k]) / l[k] * 100.0 > 4.2 and qvm[k] > 6.5:
                 had_wick = True
                 break
         if had_wick:
             continue
 
-        abv_vwap8 = int(np.sum(c[i - 8 : i] >= vwap[i - 8 : i]))
-        tbr_p8 = float(np.nanmean(tbr[i - 8 : i])) * 100.0
+        abv_vwap = int(np.sum(c[i - vh_win : i] >= vwap[i - vh_win : i]))
+        tbr_hold = float(np.nanmean(tbr[i - vh_win : i])) * 100.0
         vol_acc = float(qv[i] / max(qv[i - 1], 1.0))
         dist_s480 = (c[i - 1] - s480[i - 1]) / s480[i - 1] * 100.0
-        slp_s60 = (s60[i] - s60[i - 20]) / s60[i - 20] * 100.0
-        slp_s200 = (s200[i] - s200[i - 20]) / s200[i - 20] * 100.0
+        slp_s60 = (s60[i] - s60[i - slp_win]) / s60[i - slp_win] * 100.0
+        slp_s200 = (s200[i] - s200[i - slp_win]) / s200[i - slp_win] * 100.0
 
         has_accum_flow = (
-            (b_min10 >= 1.80 and (tbr_p8 >= 46.4 or qvm[i] >= 40.0))
-            or (cfg.m1_bbw_min_low <= b_min10 < 1.80 and tbr_p8 >= 48.0)
+            (b_min10 >= 1.80 and (tbr_hold >= 46.4 or qvm[i] >= 40.0))
+            or (cfg.m1_bbw_min_low <= b_min10 < 1.80 and tbr_hold >= 48.0)
         )
         is_m1 = (
-            abv_vwap8 == 8
+            abv_vwap == vh_win
             and cfg.m1_bbw_min_low <= b_min10 <= cfg.m1_bbw_min_high
             and b_max24 <= cfg.m1_bbw_max_pct
             and has_accum_flow
@@ -443,7 +594,7 @@ def scan_squeeze_breakouts(
         note = (
             f"★M2極致窒息核爆：6h帶寬≤{b_max24:.1f}% + 振幅{rng24:.1f}% → {qvm[i]:.1f}x巨量 + 主買{tbr[i]*100:.1f}% + 實體{clv*100:.0f}%"
             if is_m2
-            else f"★M1護盤蓄勢突破：連8根站穩VWAP + 24h箱體({rng96:.1f}%) + 帶寬({b_min10:.1f}%~{b_max24:.1f}%) → {qvm[i]:.1f}x放量(加速{vol_acc:.1f}x) + 主買{tbr[i]*100:.1f}%"
+            else f"★M1護盤蓄勢突破：連{vh_win}根站穩VWAP + 24h箱體({rng96:.1f}%) + 帶寬({b_min10:.1f}%~{b_max24:.1f}%) → {qvm[i]:.1f}x放量(加速{vol_acc:.1f}x) + 主買{tbr[i]*100:.1f}%"
         )
 
         last_idx = i
@@ -478,29 +629,32 @@ def scan_squeeze_breakouts(
 
 
 def attach_oi_and_funding(hits: Sequence[RadarHit]) -> None:
-    cache: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+    cache: Dict[Tuple[str, str], Tuple[Optional[float], Optional[float]]] = {}
+    valid_oi_periods = {"5m", "15m", "30m", "1h", "2h", "4h"}
     for hit in hits:
-        if hit.symbol not in cache:
+        oi_period = hit.interval if hit.interval in valid_oi_periods else "15m"
+        key = (hit.symbol, oi_period)
+        if key not in cache:
             oi_chg: Optional[float] = None
             fr_pct: Optional[float] = None
             try:
-                oi = api_get("/futures/data/openInterestHist", {"symbol": hit.symbol, "period": "15m", "limit": 6})
+                oi = api_get("/futures/data/openInterestHist", {"symbol": hit.symbol, "period": oi_period, "limit": 6})
                 if isinstance(oi, list) and len(oi) >= 4:
                     p0 = float(oi[0]["sumOpenInterest"])
                     p1 = float(oi[-1]["sumOpenInterest"])
                     if p0 > 0:
                         oi_chg = (p1 - p0) / p0 * 100.0
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("無法取得 %s 未平倉量 (OI): %s", hit.symbol, exc)
             try:
                 pm = api_get("/fapi/v1/premiumIndex", {"symbol": hit.symbol})
                 if isinstance(pm, dict) and pm.get("lastFundingRate") is not None:
                     fr_pct = float(pm["lastFundingRate"]) * 100.0
-            except Exception:
-                pass
-            cache[hit.symbol] = (oi_chg, fr_pct)
+            except Exception as exc:
+                logger.warning("無法取得 %s 即時資金費率: %s", hit.symbol, exc)
+            cache[key] = (oi_chg, fr_pct)
 
-        hit.oi_change_pct, hit.funding_rate_pct = cache[hit.symbol]
+        hit.oi_change_pct, hit.funding_rate_pct = cache[key]
 
 
 def render_radar_chart(
@@ -617,6 +771,29 @@ def render_radar_chart(
     plt.close(fig)
 
 
+def load_seen_state(path: Path) -> Set[Tuple[str, str]]:
+    if not path.is_file():
+        return set()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return {(str(item[0]), str(item[1])) for item in data if isinstance(item, (list, tuple)) and len(item) >= 2}
+    except Exception as exc:
+        logger.warning("讀取盯盤已通知紀錄失敗 (%s): %s", path, exc)
+    return set()
+
+
+def save_seen_state(path: Path, seen: Set[Tuple[str, str]], max_items: int = 5000) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ordered = sorted(seen, key=lambda kv: (kv[1], kv[0]))[-max_items:]
+        tmp_path = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+        tmp_path.write_text(json.dumps(ordered, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except Exception as exc:
+        logger.warning("寫入盯盤已通知紀錄失敗 (%s): %s", path, exc)
+
+
 def run_radar(
     symbols: Sequence[str],
     interval: str = "15m",
@@ -642,7 +819,8 @@ def run_radar(
             if res and plot_dir is not None:
                 render_radar_chart(df, res, sym, interval, plot_dir / f"{sym}_{interval}_squeeze_radar.png")
             return res
-        except Exception:
+        except Exception as exc:
+            logger.warning("掃描 %s (%s) 失敗: %s", sym, interval, exc)
             return []
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -682,23 +860,25 @@ def print_hits(hits: Sequence[RadarHit]) -> None:
 
 
 def main() -> int:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError) as exc:
+            logger.debug("stdout UTF-8 reconfigure skipped: %s", exc)
 
-    parser = argparse.ArgumentParser(description="幣安永續合約「Squeeze × VWAP護盤 × 主動買盤」雙模狙擊起漲雷達 v2")
+    parser = argparse.ArgumentParser(description="幣安永續合約「Squeeze × VWAP護盤 × 主動買盤」雙模狙擊起漲雷達")
     parser.add_argument("--symbols", type=str, default="", help="指定幣種測試，逗號分隔 (例如 BTCUSDT,SOLUSDT)")
-    parser.add_argument("--interval", type=str, default="15m", help="K 線週期 (5m, 15m, 1h)，預設 15m")
-    parser.add_argument("--limit", type=int, default=560, help="拉取 K 線根數，預設 560")
+    parser.add_argument("--interval", type=str, default="15m", help="K 線週期 (5m, 15m, 30m, 1h)，預設 15m")
+    parser.add_argument("--limit", type=int, default=560, help="拉取 K 線根數 (預設 560，短週期自動擴充至暖機長度)")
     parser.add_argument("--scan", action="store_true", help="執行單次全市場掃描")
     parser.add_argument("--watch", type=int, default=0, help="持續輪詢監控秒數 (例如 --watch 60)")
     parser.add_argument("--relaxed", action="store_true", help="切換為寬鬆預警模式（顯示所有初階壓縮突破）")
     parser.add_argument("--min-vol", type=float, default=1_500_000, help="24h 最低成交額 (USDT)，預設 150 萬")
     parser.add_argument("--max-symbols", type=int, default=260, help="最多掃描幣種數，預設 260")
-    parser.add_argument("--recent-bars", type=int, default=10, help="掃描模式顯示最近 N 根內的新起漲訊號")
+    parser.add_argument("--recent-bars", type=int, default=10, help="掃描模式顯示最近 N 根內的新起漲訊號 (預設 10)")
     parser.add_argument("--plot", action="store_true", help="輸出深色主題三合一雷達圖 PNG")
     parser.add_argument("--include-forming", action="store_true", help="納入尚未收盤的當根 K 線（預設僅掃描已收盤 K 線避免重繪）")
+    parser.add_argument("--seen-file", type=str, default="", help="--watch 已推播訊號持久化 JSON 檔案路徑")
     parser.add_argument("--out-dir", type=str, default="breakout_output", help="圖表輸出資料夾 (預設 breakout_output)")
     add_radar_threshold_args(parser)
     args = parser.parse_args()
@@ -729,7 +909,8 @@ def main() -> int:
     if not args.scan and args.watch <= 0:
         args.scan = True
 
-    seen: Set[Tuple[str, str]] = set()
+    seen_path = Path(args.seen_file) if args.seen_file else (out_dir / ".watch_seen_squeeze.json")
+    seen: Set[Tuple[str, str]] = load_seen_state(seen_path) if args.watch > 0 else set()
     while True:
         now_str = datetime.now(TPE).strftime("%Y-%m-%d %H:%M:%S")
         syms = list_usdt_perps(min_quote_vol_usd=args.min_vol, max_symbols=args.max_symbols)
@@ -753,9 +934,12 @@ def main() -> int:
                 if key not in seen:
                     seen.add(key)
                     fresh.append(h)
-            print_hits(fresh if fresh else hits)
             if fresh:
+                save_seen_state(seen_path, seen)
+                print_hits(fresh)
                 print(f"\a[起漲雷達] 剛偵測到 {len(fresh)} 筆新狙擊起漲訊號！")
+            else:
+                print(f"本輪無新增已收盤起漲訊號（視窗內 {len(hits)} 筆既有訊號已通知過）。")
         else:
             print_hits(hits)
 

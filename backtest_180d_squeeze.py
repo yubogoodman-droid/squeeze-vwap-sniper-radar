@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""「Squeeze × VWAP 護盤 × 主動買盤」雙模狙擊 v2 — 6 個月 (180天) 全市場實戰回測腳本
+"""「Squeeze × VWAP 護盤 × 主動買盤」雙模狙擊 — 全市場無偏誤誠實回測與 HTML 看板生成器
 
-完全獨立運作，只依賴 squeeze_breakout_radar.py，不更動任何原有腳本。
+完全獨立運作，純訊號與歷史回測工具（無下單功能、不需 API Key）。
 特色：
-1. 內建 Binance Weight 流量偵測與本地快取 (breakout_output/cache_180d/)，重跑只需 ~10 秒。
-2. 採用 v2 雙模狙擊引擎：
-   - 【M1：VWAP 護盤蓄勢突破】連 8 根站穩 12h VWAP + 24h 極窄箱體 + 中期趨勢翻揚 + 放量加速突破
-   - 【M2：極致窒息巨量核爆】6h BBW ≤ 2.2% 極度窒息後單根 30x+ 實體巨量噴發
-3. 採用「抗洗盤回測容忍 + 0.6R 保本鎖定 + 跌破 BB 中軌止盈」實戰出場（已扣 0.12% 費滑）。
-4. 自動產出每筆交易的高畫質復盤圖卡 (cards/*.png)、資金曲線與手機/電腦自適應 HTML 戰報。
+1. 支援本地快取 (--cache-dir / --npz-dir，相容 <SYMBOL>_15m_365d.pkl) 與原子寫入，中途失敗絕不污染快取。
+2. 時點滾動 24h 成交額動態標的池 + 歷史曾存續永續合約 (list_historical_usdt_perps)，無強制塞幣與字母序截斷。
+3. 保守盤中出場：+0.55R 上移保本並同根保守檢查低點、跳空按 min(open, stop) 成交、收盤破 BB 中軌按實際收盤價出場。
+4. 完整扣除可配置雙邊費滑 (預設 0.12%，並輸出 0.12%/0.30%/0.50% 敏感度) 與歷史/保守資金費率 (--funding-rate-8h 0.03)。
+5. 主指標為支援多倉併發 (--max-positions) 之 2% 以損定倉複利，附 1x 真實複利、3x 分級強平與流動性上限壓力測試、盤中 MTM MDD 與 IS/OOS + Walk-Forward 檢驗。
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html import escape
+import logging
 import os
 from pathlib import Path
 import sys
@@ -35,6 +35,13 @@ import pandas as pd
 import backtest_utils as bt_utils
 import squeeze_breakout_radar as radar
 
+logger = logging.getLogger("backtest_180d_squeeze")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.WARNING)
+
 TPE = ZoneInfo("Asia/Taipei")
 FEE_ROUNDTRIP_PCT = 0.12
 BREAKEVEN_ARM_R = 0.55
@@ -44,8 +51,8 @@ LAST_WEIGHT = 0
 COOLDOWN_UNTIL = 0.0
 
 
-def polite_get_klines(params: Dict[str, Any], retries: int = 6) -> Any:
-    """帶 Binance 1 分鐘 Weight 自適應限流的 GET 請求，避免觸發 418/429。"""
+def polite_get_klines(params: Dict[str, Any], retries: int = 6) -> Optional[List[Any]]:
+    """帶 Binance 1 分鐘 Weight 自適應限流的 GET 請求；若重試耗盡回傳 None（區分於合法空陣列 []）。"""
     global LAST_WEIGHT, COOLDOWN_UNTIL
     for attempt in range(retries):
         wait_now = 0.0
@@ -70,17 +77,37 @@ def polite_get_klines(params: Dict[str, Any], retries: int = 6) -> Any:
                 with WEIGHT_LOCK:
                     COOLDOWN_UNTIL = max(COOLDOWN_UNTIL, time.monotonic() + wait_s)
                     LAST_WEIGHT = 0
+                logger.warning(
+                    "Binance klines 限流 (HTTP %s, %s)，等待 %.1fs 後重試 (%d/%d)",
+                    resp.status_code,
+                    params.get("symbol"),
+                    wait_s,
+                    attempt + 1,
+                    retries,
+                )
                 time.sleep(wait_s)
                 continue
             resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            time.sleep(1.0 * (attempt + 1))
-    return []
+            data = resp.json()
+            return data if isinstance(data, list) else None
+        except Exception as exc:
+            wait_s = 1.0 * (attempt + 1)
+            logger.warning(
+                "拉取 klines 失敗 (%s): %s，%.1fs 後重試 (%d/%d)",
+                params.get("symbol"),
+                exc,
+                wait_s,
+                attempt + 1,
+                retries,
+            )
+            if attempt + 1 < retries:
+                time.sleep(wait_s)
+    logger.warning("放棄拉取 klines (%s)：已達最大重試次數 %d", params.get("symbol"), retries)
+    return None
 
 
 def compute_indicators(df: pd.DataFrame, interval: str = "15m") -> pd.DataFrame:
-    """呼叫 squeeze_breakout_radar v2 計算全套指標。"""
+    """呼叫 squeeze_breakout_radar 計算全套指標。"""
     return radar.compute_radar_indicators(df.copy(), interval=interval)
 
 
@@ -91,10 +118,11 @@ def fetch_klines_180d(
     cache_dir: Optional[Path] = None,
     seed_cache_dir: Optional[Path] = Path("breakout_output/cache_180d"),
 ) -> pd.DataFrame:
-    """分頁拉取指定天數完整 K 線（含 TakerBuyVol），自動銜接 180 天本地快取省去重複流量。"""
-    bar_ms = radar.INTERVAL_MS.get(interval, 900_000)
+    """分頁拉取指定天數完整已收盤 K 線；若中途請求失敗絕不寫入殘缺快取。"""
+    tf = radar.timeframe_windows(interval)
+    bar_ms = tf["bar_ms"]
     bars_per_day = max(1, int(86_400_000 // bar_ms))
-    need = days * bars_per_day + 260
+    need = days * bars_per_day + tf["min_df_len"]
 
     if cache_dir is not None:
         for candidate in (
@@ -107,8 +135,8 @@ def fetch_klines_180d(
                     if not cached.empty:
                         sub = cached.iloc[-need:] if len(cached) > need else cached
                         return compute_indicators(sub, interval=interval)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("讀取快取失敗 (%s): %s", candidate, exc)
         alt_365 = Path("breakout_output/cache_365d") / f"{symbol}_{interval}_365d.pkl"
         if days <= 365 and alt_365.exists():
             try:
@@ -116,32 +144,36 @@ def fetch_klines_180d(
                 if not c365.empty:
                     sub = c365.iloc[-need:] if len(c365) > need else c365
                     return compute_indicators(sub, interval=interval)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("讀取 365d 快取失敗 (%s): %s", alt_365, exc)
 
     seed_df: Optional[pd.DataFrame] = None
     if days > 180 and seed_cache_dir is not None:
         seed_file = seed_cache_dir / f"{symbol}_{interval}_180d.pkl"
         if seed_file.exists():
             try:
-                loaded = pd.read_pickle(seed_file)
-                if isinstance(loaded, pd.DataFrame) and not loaded.empty:
+                loaded = bt_utils.normalize_kline_df(pd.read_pickle(seed_file))
+                if not loaded.empty:
                     seed_df = loaded.sort_index()
-            except Exception:
+            except Exception as exc:
+                logger.warning("讀取種子快取失敗 (%s): %s", seed_file, exc)
                 seed_df = None
 
     raw: list = []
     remaining = max(0, need - (len(seed_df) if seed_df is not None else 0))
     end_ms: Optional[int] = int(seed_df.index[0].timestamp() * 1000) - 1 if seed_df is not None else None
     now_ms = int(time.time() * 1000)
+    fetch_failed = False
 
     while len(raw) < remaining:
-        # limit=1000 每次僅耗 5 weight (200 bars/weight)，比 limit=1500 (10 weight) 更省 25% 配額
         limit = min(1000, remaining - len(raw))
         params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
         if end_ms is not None:
             params["endTime"] = end_ms
         chunk = polite_get_klines(params)
+        if chunk is None:
+            fetch_failed = True
+            break
         if not chunk:
             break
         raw = list(chunk) + raw
@@ -150,7 +182,11 @@ def fetch_klines_180d(
             break
         time.sleep(0.05)
 
-    if raw and int(raw[-1][0]) + bar_ms > now_ms and seed_df is None:
+    if fetch_failed:
+        logger.warning("抓取 %s (%s) K 線未完整結束，略過寫入快取且不使用殘缺資料", symbol, interval)
+        return pd.DataFrame()
+
+    while raw and int(raw[-1][0]) + bar_ms > now_ms and seed_df is None:
         raw = raw[:-1]
 
     df_old = pd.DataFrame()
@@ -181,11 +217,10 @@ def fetch_klines_180d(
     df = df[~df.index.duplicated(keep="last")].sort_index()
 
     if cache_dir is not None and not df.empty:
-        cache_dir.mkdir(parents=True, exist_ok=True)
         try:
-            df.to_pickle(cache_dir / f"{symbol}_{interval}_{days}d.pkl")
-        except Exception:
-            pass
+            bt_utils.atomic_pickle_dump(df, cache_dir / f"{symbol}_{interval}_{days}d.pkl")
+        except Exception as exc:
+            logger.warning("寫入快取失敗 (%s): %s", symbol, exc)
 
     return compute_indicators(df, interval=interval)
 
@@ -262,7 +297,7 @@ def simulate_trade(
     closes = df["Close"].to_numpy(float)
     bb_mid = df["BB_MID"].to_numpy(float)
     times = df.index
-    bar_ms = radar.INTERVAL_MS.get(hit.interval, 900_000)
+    bar_ms = radar.interval_to_ms(hit.interval)
 
     end_i = min(len(df) - 1, i0 + max_hold_bars)
     max_fav = float(np.max(highs[i0 + 1 : end_i + 1]) - entry) / entry * 100.0 if end_i > i0 else 0.0
@@ -870,10 +905,11 @@ def write_html_report(
 
 
 def main() -> int:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError) as exc:
+            logger.debug("stdout UTF-8 reconfigure skipped: %s", exc)
 
     parser = argparse.ArgumentParser(description="Squeeze 雙模狙擊雷達 v2 — 全市場無偏誤回測")
     parser.add_argument("--interval", type=str, default="15m")
@@ -902,7 +938,12 @@ def main() -> int:
         default=BREAKEVEN_BUFFER_PCT,
         help=f"保本止損高於進場價之緩衝 %% (預設 {BREAKEVEN_BUFFER_PCT})",
     )
-    parser.add_argument("--max-hold-bars", type=int, default=160, help="最長持有 K 線根數 (預設 160)")
+    parser.add_argument(
+        "--max-hold-bars",
+        type=int,
+        default=0,
+        help="最長持有 K 線根數 (0=按 K 線時長自動換算 40h，15m 下為 160 根)",
+    )
     parser.add_argument(
         "--fee-pct",
         "--roundtrip-cost-pct",
@@ -960,9 +1001,11 @@ def main() -> int:
     print(f"開始執行雙模狙擊 {args.days} 天 ({args.interval}) 全市場無偏誤回測：候選池共 {len(syms)} 檔合約...")
     t0 = time.time()
 
-    bar_ms = radar.INTERVAL_MS.get(args.interval, 900_000)
+    tf_win = radar.timeframe_windows(args.interval)
+    bar_ms = tf_win["bar_ms"]
     bars_per_day = max(1, int(86_400_000 // bar_ms))
-    need = args.days * bars_per_day + 260
+    need = args.days * bars_per_day + tf_win["min_df_len"]
+    eff_max_hold_bars = args.max_hold_bars if args.max_hold_bars > 0 else tf_win["max_hold_bars"]
 
     all_dfs: Dict[str, pd.DataFrame] = {}
     dfs_lock = threading.Lock()
@@ -1019,7 +1062,7 @@ def main() -> int:
             tr = simulate_trade(
                 df,
                 h,
-                max_hold_bars=args.max_hold_bars,
+                max_hold_bars=eff_max_hold_bars,
                 breakeven_arm_r=args.breakeven_r,
                 breakeven_buffer_pct=args.breakeven_buffer_pct,
                 roundtrip_cost_pct=args.fee_pct,

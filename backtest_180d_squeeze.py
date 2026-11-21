@@ -217,6 +217,8 @@ class SimTrade:
     exit_reason_trend: str
     max_fav_pct: float
     hold_bars: int
+    worst_low_price: float = 0.0
+    exit_3r_idx: int = 0
     is_oos: bool = False
     card_rel_path: str = ""
     hit: Optional[radar.RadarHit] = None
@@ -229,13 +231,13 @@ def simulate_trade(
     breakeven_arm_r: float = BREAKEVEN_ARM_R,
     breakeven_buffer_pct: float = BREAKEVEN_BUFFER_PCT,
 ) -> Optional[SimTrade]:
-    """從訊號收盤價進場，模擬抗回踩趨勢追蹤出場（+0.55R 保本鎖定 + 跌破 BB 中軌止盈，扣費滑）。"""
+    """從訊號收盤價進場，模擬抗回踩趨勢追蹤出場（+0.55R 保本鎖定並同根保守檢查低點 + 跌破 BB 中軌止盈，跳空按 min(open, stop) 成交）。"""
     i0 = hit.bar_idx
     if i0 >= len(df) - 2:
         return None
 
-    entry = hit.price
-    stop = hit.stop_price
+    entry = float(hit.price)
+    stop = float(hit.stop_price)
     risk = entry - stop
     if risk <= 0 or entry <= 0:
         return None
@@ -243,6 +245,7 @@ def simulate_trade(
     if risk_pct < 0.8 or risk_pct > 14.0:
         return None
 
+    opens = df["Open"].to_numpy(float)
     highs = df["High"].to_numpy(float)
     lows = df["Low"].to_numpy(float)
     closes = df["Close"].to_numpy(float)
@@ -252,37 +255,47 @@ def simulate_trade(
     end_i = min(len(df) - 1, i0 + max_hold_bars)
     max_fav = float(np.max(highs[i0 + 1 : end_i + 1]) - entry) / entry * 100.0 if end_i > i0 else 0.0
 
-    # 1) 對照組：固定 3R
+    # 1) 對照組：固定 3R（同根先保守檢查止損，跳空穿價以 min(open, stop) 成交）
     target_3r = entry + 3.0 * risk
-    exit_3r = closes[end_i]
+    exit_3r = float(closes[end_i])
+    exit_3r_idx = end_i
     for k in range(i0 + 1, end_i + 1):
-        if lows[k] <= stop:
-            exit_3r = stop
+        if lows[k] <= stop or opens[k] <= stop:
+            exit_3r = float(min(opens[k], stop))
+            exit_3r_idx = k
             break
         if highs[k] >= target_3r:
-            exit_3r = target_3r
+            exit_3r = float(target_3r)
+            exit_3r_idx = k
             break
     pnl_3r = (exit_3r - entry) / entry * 100.0 - FEE_ROUNDTRIP_PCT
     r_3r = pnl_3r / risk_pct
 
-    # 2) 主戰策略：抗回踩趨勢追蹤 (+0.55R 保本保護，確認脫離成本後跌破 BB 中軌止盈)
-    cur_stop = stop
+    # 2) 主戰策略：抗回踩趨勢追蹤（同根上移保本止損後立即保守檢查當根低點；跳空以 min(open, stop) 成交；收盤破中軌按實際收盤價出場）
+    cur_stop = float(stop)
     armed = False
     exit_idx = end_i
-    exit_px = closes[end_i]
+    exit_px = float(closes[end_i])
     reason = "時間到期"
+    worst_low = float(entry)
 
     for k in range(i0 + 1, end_i + 1):
-        if lows[k] <= cur_stop:
-            exit_px = cur_stop
+        worst_low = min(worst_low, float(lows[k]), float(opens[k]))
+        if lows[k] <= cur_stop or opens[k] <= cur_stop:
+            exit_px = float(min(opens[k], cur_stop))
             exit_idx = k
             reason = "保本止盈" if armed else "初始止損"
             break
-        if highs[k] >= entry + breakeven_arm_r * risk:
+        if not armed and highs[k] >= entry + breakeven_arm_r * risk:
             armed = True
-            cur_stop = max(cur_stop, entry * (1.0 + breakeven_buffer_pct / 100.0))
+            cur_stop = float(max(cur_stop, entry * (1.0 + breakeven_buffer_pct / 100.0)))
+            if lows[k] <= cur_stop:
+                exit_px = float(min(highs[k], cur_stop))
+                exit_idx = k
+                reason = "保本止盈"
+                break
         if armed and (k - i0) >= 2 and np.isfinite(bb_mid[k]) and closes[k] < bb_mid[k]:
-            exit_px = max(closes[k], cur_stop)
+            exit_px = float(closes[k])
             exit_idx = k
             reason = "跌破BB中軌止盈"
             break
@@ -316,6 +329,8 @@ def simulate_trade(
         exit_reason_trend=reason,
         max_fav_pct=max_fav,
         hold_bars=exit_idx - i0,
+        worst_low_price=worst_low,
+        exit_3r_idx=exit_3r_idx,
         hit=hit,
     )
 

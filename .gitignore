@@ -1,5 +1,12 @@
 __pycache__/
+.pytest_cache/
 *.py[cod]
+*$py.class
 *.pkl
+*.npz
+*.tmp
+*.watch_seen*.json
+.watch_seen*.json
+breakout_output/cache_*/
 .DS_Store
 .env

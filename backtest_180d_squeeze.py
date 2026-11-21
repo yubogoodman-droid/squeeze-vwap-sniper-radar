@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""「Squeeze × VWAP 護盤 × 主動買盤」雙模狙擊 v2 — 6 個月 (180天) 全市場實戰回測腳本
+"""「Squeeze × VWAP 護盤 × 主動買盤」雙模狙擊 — 全市場無偏誤誠實回測與 HTML 看板生成器
 
-完全獨立運作，只依賴 squeeze_breakout_radar.py，不更動任何原有腳本。
+完全獨立運作，純訊號與歷史回測工具（無下單功能、不需 API Key）。
 特色：
-1. 內建 Binance Weight 流量偵測與本地快取 (breakout_output/cache_180d/)，重跑只需 ~10 秒。
-2. 採用 v2 雙模狙擊引擎：
-   - 【M1：VWAP 護盤蓄勢突破】連 8 根站穩 12h VWAP + 24h 極窄箱體 + 中期趨勢翻揚 + 放量加速突破
-   - 【M2：極致窒息巨量核爆】6h BBW ≤ 2.2% 極度窒息後單根 30x+ 實體巨量噴發
-3. 採用「抗洗盤回測容忍 + 0.6R 保本鎖定 + 跌破 BB 中軌止盈」實戰出場（已扣 0.12% 費滑）。
-4. 自動產出每筆交易的高畫質復盤圖卡 (cards/*.png)、資金曲線與手機/電腦自適應 HTML 戰報。
+1. 支援本地快取 (--cache-dir / --npz-dir，相容 <SYMBOL>_15m_365d.pkl) 與原子寫入，中途失敗絕不污染快取。
+2. 時點滾動 24h 成交額動態標的池 + 歷史曾存續永續合約 (list_historical_usdt_perps)，無強制塞幣與字母序截斷。
+3. 保守盤中出場：+0.55R 上移保本並同根保守檢查低點、跳空按 min(open, stop) 成交、收盤破 BB 中軌按實際收盤價出場。
+4. 完整扣除可配置雙邊費滑 (預設 0.12%，並輸出 0.12%/0.30%/0.50% 敏感度) 與歷史/保守資金費率 (--funding-rate-8h 0.03)。
+5. 主指標為支援多倉併發 (--max-positions) 之 2% 以損定倉複利，附 1x 真實複利、3x 分級強平與流動性上限壓力測試、盤中 MTM MDD 與 IS/OOS + Walk-Forward 檢驗。
 """
 
 from __future__ import annotations
@@ -16,8 +15,10 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
+import logging
+import os
 from pathlib import Path
 import sys
 import threading
@@ -31,17 +32,27 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import backtest_utils as bt_utils
 import squeeze_breakout_radar as radar
+
+logger = logging.getLogger("backtest_180d_squeeze")
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.WARNING)
 
 TPE = ZoneInfo("Asia/Taipei")
 FEE_ROUNDTRIP_PCT = 0.12
+BREAKEVEN_ARM_R = 0.55
+BREAKEVEN_BUFFER_PCT = 0.30
 WEIGHT_LOCK = threading.Lock()
 LAST_WEIGHT = 0
 COOLDOWN_UNTIL = 0.0
 
 
-def polite_get_klines(params: Dict[str, Any], retries: int = 6) -> Any:
-    """帶 Binance 1 分鐘 Weight 自適應限流的 GET 請求，避免觸發 418/429。"""
+def polite_get_klines(params: Dict[str, Any], retries: int = 6) -> Optional[List[Any]]:
+    """帶 Binance 1 分鐘 Weight 自適應限流的 GET 請求；若重試耗盡回傳 None（區分於合法空陣列 []）。"""
     global LAST_WEIGHT, COOLDOWN_UNTIL
     for attempt in range(retries):
         wait_now = 0.0
@@ -66,17 +77,37 @@ def polite_get_klines(params: Dict[str, Any], retries: int = 6) -> Any:
                 with WEIGHT_LOCK:
                     COOLDOWN_UNTIL = max(COOLDOWN_UNTIL, time.monotonic() + wait_s)
                     LAST_WEIGHT = 0
+                logger.warning(
+                    "Binance klines 限流 (HTTP %s, %s)，等待 %.1fs 後重試 (%d/%d)",
+                    resp.status_code,
+                    params.get("symbol"),
+                    wait_s,
+                    attempt + 1,
+                    retries,
+                )
                 time.sleep(wait_s)
                 continue
             resp.raise_for_status()
-            return resp.json()
-        except Exception:
-            time.sleep(1.0 * (attempt + 1))
-    return []
+            data = resp.json()
+            return data if isinstance(data, list) else None
+        except Exception as exc:
+            wait_s = 1.0 * (attempt + 1)
+            logger.warning(
+                "拉取 klines 失敗 (%s): %s，%.1fs 後重試 (%d/%d)",
+                params.get("symbol"),
+                exc,
+                wait_s,
+                attempt + 1,
+                retries,
+            )
+            if attempt + 1 < retries:
+                time.sleep(wait_s)
+    logger.warning("放棄拉取 klines (%s)：已達最大重試次數 %d", params.get("symbol"), retries)
+    return None
 
 
 def compute_indicators(df: pd.DataFrame, interval: str = "15m") -> pd.DataFrame:
-    """呼叫 squeeze_breakout_radar v2 計算全套指標。"""
+    """呼叫 squeeze_breakout_radar 計算全套指標。"""
     return radar.compute_radar_indicators(df.copy(), interval=interval)
 
 
@@ -87,54 +118,62 @@ def fetch_klines_180d(
     cache_dir: Optional[Path] = None,
     seed_cache_dir: Optional[Path] = Path("breakout_output/cache_180d"),
 ) -> pd.DataFrame:
-    """分頁拉取指定天數完整 K 線（含 TakerBuyVol），自動銜接 180 天本地快取省去重複流量。"""
-    bar_ms = radar.INTERVAL_MS.get(interval, 900_000)
+    """分頁拉取指定天數完整已收盤 K 線；若中途請求失敗絕不寫入殘缺快取。"""
+    tf = radar.timeframe_windows(interval)
+    bar_ms = tf["bar_ms"]
     bars_per_day = max(1, int(86_400_000 // bar_ms))
-    need = days * bars_per_day + 260
+    need = days * bars_per_day + tf["min_df_len"]
 
     if cache_dir is not None:
-        cache_file = cache_dir / f"{symbol}_{interval}_{days}d.pkl"
-        if cache_file.exists():
-            try:
-                cached = pd.read_pickle(cache_file)
-                if isinstance(cached, pd.DataFrame) and not cached.empty:
-                    return compute_indicators(cached.astype(float), interval=interval)
-            except Exception:
-                pass
-        # 若查詢天數 <= 365 且已有 365d 快取，直接從 365d 快取切片免重抓與免佔雙倍硬碟空間
+        for candidate in (
+            cache_dir / f"{symbol}_{interval}_{days}d.pkl",
+            cache_dir / f"{symbol}_{interval}_365d.pkl" if days <= 365 else None,
+        ):
+            if candidate is not None and candidate.exists():
+                try:
+                    cached = bt_utils.normalize_kline_df(pd.read_pickle(candidate))
+                    if not cached.empty:
+                        sub = cached.iloc[-need:] if len(cached) > need else cached
+                        return compute_indicators(sub, interval=interval)
+                except Exception as exc:
+                    logger.warning("讀取快取失敗 (%s): %s", candidate, exc)
         alt_365 = Path("breakout_output/cache_365d") / f"{symbol}_{interval}_365d.pkl"
         if days <= 365 and alt_365.exists():
             try:
-                c365 = pd.read_pickle(alt_365)
-                if isinstance(c365, pd.DataFrame) and not c365.empty:
-                    sub = c365.iloc[-need:].astype(float) if len(c365) > need else c365.astype(float)
+                c365 = bt_utils.normalize_kline_df(pd.read_pickle(alt_365))
+                if not c365.empty:
+                    sub = c365.iloc[-need:] if len(c365) > need else c365
                     return compute_indicators(sub, interval=interval)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("讀取 365d 快取失敗 (%s): %s", alt_365, exc)
 
     seed_df: Optional[pd.DataFrame] = None
     if days > 180 and seed_cache_dir is not None:
         seed_file = seed_cache_dir / f"{symbol}_{interval}_180d.pkl"
         if seed_file.exists():
             try:
-                loaded = pd.read_pickle(seed_file)
-                if isinstance(loaded, pd.DataFrame) and not loaded.empty:
+                loaded = bt_utils.normalize_kline_df(pd.read_pickle(seed_file))
+                if not loaded.empty:
                     seed_df = loaded.sort_index()
-            except Exception:
+            except Exception as exc:
+                logger.warning("讀取種子快取失敗 (%s): %s", seed_file, exc)
                 seed_df = None
 
     raw: list = []
     remaining = max(0, need - (len(seed_df) if seed_df is not None else 0))
     end_ms: Optional[int] = int(seed_df.index[0].timestamp() * 1000) - 1 if seed_df is not None else None
     now_ms = int(time.time() * 1000)
+    fetch_failed = False
 
     while len(raw) < remaining:
-        # limit=1000 每次僅耗 5 weight (200 bars/weight)，比 limit=1500 (10 weight) 更省 25% 配額
         limit = min(1000, remaining - len(raw))
         params: Dict[str, Any] = {"symbol": symbol, "interval": interval, "limit": limit}
         if end_ms is not None:
             params["endTime"] = end_ms
         chunk = polite_get_klines(params)
+        if chunk is None:
+            fetch_failed = True
+            break
         if not chunk:
             break
         raw = list(chunk) + raw
@@ -143,7 +182,11 @@ def fetch_klines_180d(
             break
         time.sleep(0.05)
 
-    if raw and int(raw[-1][0]) + bar_ms > now_ms and seed_df is None:
+    if fetch_failed:
+        logger.warning("抓取 %s (%s) K 線未完整結束，略過寫入快取且不使用殘缺資料", symbol, interval)
+        return pd.DataFrame()
+
+    while raw and int(raw[-1][0]) + bar_ms > now_ms and seed_df is None:
         raw = raw[:-1]
 
     df_old = pd.DataFrame()
@@ -174,11 +217,10 @@ def fetch_klines_180d(
     df = df[~df.index.duplicated(keep="last")].sort_index()
 
     if cache_dir is not None and not df.empty:
-        cache_dir.mkdir(parents=True, exist_ok=True)
         try:
-            df.to_pickle(cache_dir / f"{symbol}_{interval}_{days}d.pkl")
-        except Exception:
-            pass
+            bt_utils.atomic_pickle_dump(df, cache_dir / f"{symbol}_{interval}_{days}d.pkl")
+        except Exception as exc:
+            logger.warning("寫入快取失敗 (%s): %s", symbol, exc)
 
     return compute_indicators(df, interval=interval)
 
@@ -210,18 +252,38 @@ class SimTrade:
     exit_reason_trend: str
     max_fav_pct: float
     hold_bars: int
+    funding_cost_pct: float = 0.0
+    funding_source: str = "est"
+    roundtrip_cost_pct: float = FEE_ROUNDTRIP_PCT
+    worst_low_price: float = 0.0
+    bar_quote_vol_usd: float = 0.0
+    trailing_24h_qv_usd: float = 0.0
+    mtm_times_ms: Optional[np.ndarray] = None
+    mtm_trough_prices: Optional[np.ndarray] = None
+    mtm_close_prices: Optional[np.ndarray] = None
+    exit_3r_idx: int = 0
+    is_oos: bool = False
     card_rel_path: str = ""
     hit: Optional[radar.RadarHit] = None
 
 
-def simulate_trade(df: pd.DataFrame, hit: radar.RadarHit, max_hold_bars: int = 160) -> Optional[SimTrade]:
-    """從訊號收盤價進場，模擬抗回踩趨勢追蹤出場（+0.6R 保本鎖定 + 跌破 BB 中軌止盈，扣 0.12% 費滑）。"""
+def simulate_trade(
+    df: pd.DataFrame,
+    hit: radar.RadarHit,
+    max_hold_bars: int = 160,
+    breakeven_arm_r: float = BREAKEVEN_ARM_R,
+    breakeven_buffer_pct: float = BREAKEVEN_BUFFER_PCT,
+    roundtrip_cost_pct: float = FEE_ROUNDTRIP_PCT,
+    funding_store: Optional[bt_utils.FundingRateStore] = None,
+    trailing_24h_qv_usd: float = 0.0,
+) -> Optional[SimTrade]:
+    """從訊號收盤價進場，模擬抗回踩趨勢追蹤出場（+0.55R 保本鎖定並同根保守檢查低點 + 跌破 BB 中軌止盈，扣費滑與資金費率）。"""
     i0 = hit.bar_idx
     if i0 >= len(df) - 2:
         return None
 
-    entry = hit.price
-    stop = hit.stop_price
+    entry = float(hit.price)
+    stop = float(hit.stop_price)
     risk = entry - stop
     if risk <= 0 or entry <= 0:
         return None
@@ -229,52 +291,86 @@ def simulate_trade(df: pd.DataFrame, hit: radar.RadarHit, max_hold_bars: int = 1
     if risk_pct < 0.8 or risk_pct > 14.0:
         return None
 
+    opens = df["Open"].to_numpy(float)
     highs = df["High"].to_numpy(float)
     lows = df["Low"].to_numpy(float)
     closes = df["Close"].to_numpy(float)
     bb_mid = df["BB_MID"].to_numpy(float)
     times = df.index
+    bar_ms = radar.interval_to_ms(hit.interval)
 
     end_i = min(len(df) - 1, i0 + max_hold_bars)
     max_fav = float(np.max(highs[i0 + 1 : end_i + 1]) - entry) / entry * 100.0 if end_i > i0 else 0.0
 
-    # 1) 對照組：固定 3R
+    # 1) 對照組：固定 3R（同根先保守檢查止損，跳空穿價以 min(open, stop) 成交）
     target_3r = entry + 3.0 * risk
-    exit_3r = closes[end_i]
+    exit_3r = float(closes[end_i])
+    exit_3r_idx = end_i
     for k in range(i0 + 1, end_i + 1):
-        if lows[k] <= stop:
-            exit_3r = stop
+        if lows[k] <= stop or opens[k] <= stop:
+            exit_3r = float(min(opens[k], stop))
+            exit_3r_idx = k
             break
         if highs[k] >= target_3r:
-            exit_3r = target_3r
+            exit_3r = float(target_3r)
+            exit_3r_idx = k
             break
-    pnl_3r = (exit_3r - entry) / entry * 100.0 - FEE_ROUNDTRIP_PCT
+    fc_3r = 0.0
+    if funding_store is not None:
+        fc_3r, _, _ = funding_store.compute_funding_cost_pct(
+            hit.symbol, bt_utils.ts_to_ms(times[i0]), bt_utils.ts_to_ms(times[exit_3r_idx]), bar_ms=bar_ms
+        )
+    pnl_3r = (exit_3r - entry) / entry * 100.0 - roundtrip_cost_pct - fc_3r
     r_3r = pnl_3r / risk_pct
 
-    # 2) 主戰策略：抗回踩趨勢追蹤 (+0.6R 保本保護，確認脫離成本後跌破 BB 中軌止盈)
-    cur_stop = stop
+    # 2) 主戰策略：抗回踩趨勢追蹤（同根上移保本止損後立即保守檢查當根低點；跳空以 min(open, stop) 成交；收盤破中軌按實際收盤價出場）
+    cur_stop = float(stop)
     armed = False
     exit_idx = end_i
-    exit_px = closes[end_i]
+    exit_px = float(closes[end_i])
     reason = "時間到期"
+    worst_low = float(entry)
 
     for k in range(i0 + 1, end_i + 1):
-        if lows[k] <= cur_stop:
-            exit_px = cur_stop
+        worst_low = min(worst_low, float(lows[k]), float(opens[k]))
+        if lows[k] <= cur_stop or opens[k] <= cur_stop:
+            exit_px = float(min(opens[k], cur_stop))
             exit_idx = k
             reason = "保本止盈" if armed else "初始止損"
             break
-        if highs[k] >= entry + 0.55 * risk:
+        if not armed and highs[k] >= entry + breakeven_arm_r * risk:
             armed = True
-            cur_stop = max(cur_stop, entry * 1.003)
+            cur_stop = float(max(cur_stop, entry * (1.0 + breakeven_buffer_pct / 100.0)))
+            if lows[k] <= cur_stop:
+                exit_px = float(min(highs[k], cur_stop))
+                exit_idx = k
+                reason = "保本止盈"
+                break
         if armed and (k - i0) >= 2 and np.isfinite(bb_mid[k]) and closes[k] < bb_mid[k]:
-            exit_px = max(closes[k], cur_stop)
+            exit_px = float(closes[k])
             exit_idx = k
             reason = "跌破BB中軌止盈"
             break
 
-    pnl_trend = (exit_px - entry) / entry * 100.0 - FEE_ROUNDTRIP_PCT
+    funding_cost_pct = 0.0
+    funding_source = "none"
+    if funding_store is not None:
+        funding_cost_pct, _, funding_source = funding_store.compute_funding_cost_pct(
+            hit.symbol, bt_utils.ts_to_ms(times[i0]), bt_utils.ts_to_ms(times[exit_idx]), bar_ms=bar_ms
+        )
+
+    pnl_trend = (exit_px - entry) / entry * 100.0 - roundtrip_cost_pct - funding_cost_pct
     r_trend = pnl_trend / risk_pct
+
+    sl = slice(i0 + 1, exit_idx + 1)
+    idx_utc = pd.DatetimeIndex(times[sl]).tz_convert("UTC")
+    mtm_times_ms = np.asarray(idx_utc.as_unit("ms").asi8, dtype=np.int64)
+    mtm_troughs = np.minimum(lows[sl], opens[sl]).astype(np.float64, copy=True)
+    mtm_closes = closes[sl].astype(np.float64, copy=True)
+    if len(mtm_troughs) > 0:
+        if reason in ("初始止損", "保本止盈"):
+            mtm_troughs[-1] = float(exit_px)
+        mtm_closes[-1] = float(exit_px)
 
     return SimTrade(
         symbol=hit.symbol,
@@ -302,6 +398,16 @@ def simulate_trade(df: pd.DataFrame, hit: radar.RadarHit, max_hold_bars: int = 1
         exit_reason_trend=reason,
         max_fav_pct=max_fav,
         hold_bars=exit_idx - i0,
+        funding_cost_pct=funding_cost_pct,
+        funding_source=funding_source,
+        roundtrip_cost_pct=roundtrip_cost_pct,
+        worst_low_price=worst_low,
+        bar_quote_vol_usd=float(hit.quote_vol_usd),
+        trailing_24h_qv_usd=float(trailing_24h_qv_usd),
+        mtm_times_ms=mtm_times_ms,
+        mtm_trough_prices=mtm_troughs,
+        mtm_close_prices=mtm_closes,
+        exit_3r_idx=exit_3r_idx,
         hit=hit,
     )
 
@@ -310,13 +416,12 @@ def summarize_trades(trades: Sequence[SimTrade]) -> Dict[str, Any]:
     if not trades:
         return {
             "n": 0, "wins": 0, "win_rate": 0.0, "sum_pnl": 0.0, "sum_r": 0.0,
-            "avg_pnl": 0.0, "exp_r": 0.0, "pf": 0.0, "max_loss_streak": 0,
+            "avg_pnl": 0.0, "exp_r": 0.0, "pf": None, "max_loss_streak": 0,
         }
     pnls = [t.pnl_trend for t in trades]
     rs = [t.r_trend for t in trades]
     win_p = [p for p in pnls if p > 0]
-    loss_p = [abs(p) for p in pnls if p <= 0]
-    pf = (sum(win_p) / sum(loss_p)) if loss_p and sum(loss_p) > 0 else 999.0
+    pf = bt_utils.compute_profit_factor(pnls)
 
     streak = 0
     max_streak = 0
@@ -341,72 +446,78 @@ def summarize_trades(trades: Sequence[SimTrade]) -> Dict[str, Any]:
 
 
 def simulate_portfolio_3x(
-    trades: Sequence[SimTrade], initial_cap: float = 1000.0, leverage: float = 3.0, risk_pct_per_trade: float = 2.0
+    trades: Sequence[SimTrade],
+    initial_cap: float = 1000.0,
+    leverage: float = 3.0,
+    risk_pct_per_trade: float = 2.0,
+    max_positions: int = 3,
+    apply_liquidity_cap: bool = True,
+    max_bar_vol_share: float = 0.02,
+    base_mmr: float = 0.015,
 ) -> Dict[str, Any]:
-    """單倉排他模擬：3x 全倉滾倉 + 2% 以損定倉安全滾倉(上限3x) + 固定 3x 單利。"""
-    ordered = sorted(trades, key=lambda t: t.entry_time)
-    eq_comp = initial_cap
-    eq_risk2 = initial_cap
-    eq_fixed = initial_cap
-    peak = initial_cap
-    peak_r2 = initial_cap
-    mdd = 0.0
-    mdd_r2 = 0.0
-    curve_comp = [initial_cap]
-    curve_risk2 = [initial_cap]
-    curve_fixed = [initial_cap]
-    labels = ["起點"]
-    executed: List[Tuple[SimTrade, float, float]] = []
-    skipped = 0
-    cur_exit: Optional[datetime] = None
+    """誠實資金模擬：2% 以損定倉併發複利(主指標) + 1x 真實複利 + 3x 壓力測試(含分級強平與流動性上限) + 盤中 MTM MDD。"""
+    inputs = _to_portfolio_inputs(trades)
+    res = bt_utils.simulate_honest_portfolio(
+        inputs,
+        initial_cap=initial_cap,
+        risk_pct_per_trade=risk_pct_per_trade,
+        max_positions=max_positions,
+        leverage_3x=leverage,
+        slots_3x=1,
+        base_mmr=base_mmr,
+        apply_liquidity_cap=apply_liquidity_cap,
+        max_bar_vol_share=max_bar_vol_share,
+    )
+    hr = res["headline_risk"]
+    sp = res["spot_1x"]
+    c3 = res["comp_3x"]
+    f3 = res["fixed_3x"]
 
-    for t in ordered:
-        if cur_exit is not None and t.entry_time < cur_exit:
-            skipped += 1
-            continue
-        cur_exit = t.exit_time_trend
-        lev_ret = max(-0.95, (t.pnl_trend / 100.0) * leverage)
-        eq_comp *= 1.0 + lev_ret
-
-        # 以損定倉：單筆止損僅風險總資金 2%，最高不超過 3x 槓桿
-        pos_mult = min(leverage, risk_pct_per_trade / max(t.risk_pct, 0.5))
-        r2_ret = max(-0.95, (t.pnl_trend / 100.0) * pos_mult)
-        eq_risk2 *= 1.0 + r2_ret
-
-        eq_fixed += initial_cap * lev_ret
-        peak = max(peak, eq_comp)
-        peak_r2 = max(peak_r2, eq_risk2)
-        mdd = min(mdd, (eq_comp - peak) / peak * 100.0)
-        mdd_r2 = min(mdd_r2, (eq_risk2 - peak_r2) / peak_r2 * 100.0)
-        curve_comp.append(eq_comp)
-        curve_risk2.append(eq_risk2)
-        curve_fixed.append(eq_fixed)
-        labels.append(f"{t.symbol.replace('USDT','')}\n{t.entry_time.strftime('%m-%d')}")
-        executed.append((t, lev_ret * 100.0, eq_comp))
-
+    executed_risk = [(rec.trade.payload, rec.acct_ret_pct, rec.equity_after_usd) for rec in hr["records"]]
+    executed_3x = [(rec.trade.payload, rec.acct_ret_pct, rec.equity_after_usd) for rec in c3["records"]]
     return {
         "initial_cap": initial_cap,
         "leverage": leverage,
-        "eq_comp": eq_comp,
-        "comp_ret_pct": (eq_comp / initial_cap - 1.0) * 100.0,
-        "eq_risk2": eq_risk2,
-        "risk2_ret_pct": (eq_risk2 / initial_cap - 1.0) * 100.0,
-        "mdd_risk2": mdd_r2,
-        "eq_fixed": eq_fixed,
-        "fixed_ret_pct": (eq_fixed / initial_cap - 1.0) * 100.0,
-        "mdd": mdd,
-        "executed_count": len(executed),
-        "skipped_count": skipped,
-        "executed": executed,
-        "curve_comp": curve_comp,
-        "curve_risk2": curve_risk2,
-        "curve_fixed": curve_fixed,
-        "labels": labels,
+        "risk_pct_per_trade": risk_pct_per_trade,
+        "max_positions": max_positions,
+        "eq_risk2": hr["final_eq"],
+        "risk2_ret_pct": hr["ret_pct"],
+        "mdd_risk2": -hr["mdd_pct"],
+        "executed_count": hr["executed_count"],
+        "skipped_count": hr["skipped_count"],
+        "executed": executed_risk,
+        "curve_risk2": hr["curve_values"],
+        "curve_risk2_times": hr["curve_times"],
+        "labels": hr["curve_labels"],
+        "eq_spot_1x": sp["final_eq"],
+        "spot_1x_ret_pct": sp["ret_pct"],
+        "mdd_spot_1x": -sp["mdd_pct"],
+        "curve_spot_1x": sp["curve_values"],
+        "curve_spot_1x_times": sp["curve_times"],
+        "eq_comp": c3["final_eq"],
+        "comp_ret_pct": c3["ret_pct"],
+        "mdd": -c3["mdd_pct"],
+        "executed_3x": executed_3x,
+        "liq_capped_3x": c3["liquidity_capped_count"],
+        "liquidated_3x": c3["liquidated_count"],
+        "curve_comp": c3["curve_values"],
+        "curve_comp_times": c3["curve_times"],
+        "eq_fixed": f3["final_eq"],
+        "fixed_ret_pct": f3["ret_pct"],
+        "curve_fixed": f3["curve_values"],
+        "curve_fixed_times": f3["curve_times"],
+        "arith_sum_1x_pct": res["arith_sum_1x_pct"],
+        "total_funding_pct": res["total_funding_pct"],
     }
 
 
 def plot_equity_curves(
-    trades: Sequence[SimTrade], port: Dict[str, Any], out_path: Path, days: int, n_syms: int
+    trades: Sequence[SimTrade],
+    port: Dict[str, Any],
+    out_path: Path,
+    days: int,
+    n_syms: int,
+    base_cost_pct: float = FEE_ROUNDTRIP_PCT,
 ) -> None:
     plt.rcParams["font.sans-serif"] = ["Microsoft JhengHei", "SimHei", "DejaVu Sans"]
     plt.rcParams["axes.unicode_minus"] = False
@@ -420,53 +531,52 @@ def plot_equity_curves(
         for sp in ax.spines.values():
             sp.set_color("#334155")
 
-    x_eq = np.arange(len(port["curve_comp"]))
-    ax1.plot(
-        x_eq,
-        port["curve_comp"],
-        marker="o",
-        markersize=5,
-        linewidth=2.4,
-        color="#4ade80",
-        label=f"3x 單倉複利滾倉 ($1,000 → ${port['eq_comp']:,.0f}, {port['comp_ret_pct']:+.0f}%, MDD {port['mdd']:.1f}%)",
-    )
-    ax1.plot(
-        x_eq,
-        port["curve_fixed"],
-        marker="s",
-        markersize=4,
-        linewidth=1.8,
-        linestyle="--",
-        color="#38bdf8",
-        label=f"3x 單利固定倉 ($1,000 → ${port['eq_fixed']:,.0f}, {port['fixed_ret_pct']:+.0f}%)",
-    )
-    ax1.plot(
-        x_eq,
-        port["curve_risk2"],
-        marker="^",
-        markersize=4,
-        linewidth=1.8,
-        linestyle="-.",
-        color="#fbbf24",
-        label=f"2% 以損定倉安全複利 ($1,000 → ${port['eq_risk2']:,.0f}, {port['risk2_ret_pct']:+.0f}%, MDD {port['mdd_risk2']:.1f}%)",
-    )
+    if port.get("curve_risk2_times"):
+        ax1.step(
+            port["curve_risk2_times"],
+            port["curve_risk2"],
+            where="post",
+            linewidth=2.5,
+            color="#4ade80",
+            label=(
+                f"★ 主指標 {port['risk_pct_per_trade']:g}% 以損定倉複利 "
+                f"($1,000 → ${port['eq_risk2']:,.0f}, {port['risk2_ret_pct']:+.1f}%, 盤中MDD {port['mdd_risk2']:.1f}%)"
+            ),
+        )
+    if port.get("curve_spot_1x_times"):
+        ax1.step(
+            port["curve_spot_1x_times"],
+            port["curve_spot_1x"],
+            where="post",
+            linewidth=1.9,
+            linestyle="--",
+            color="#38bdf8",
+            label=f"1x 真實無槓桿複利 ($1,000 → ${port['eq_spot_1x']:,.0f}, {port['spot_1x_ret_pct']:+.1f}%, 盤中MDD {port['mdd_spot_1x']:.1f}%)",
+        )
+    if port.get("curve_comp_times"):
+        ax1.step(
+            port["curve_comp_times"],
+            port["curve_comp"],
+            where="post",
+            linewidth=1.6,
+            linestyle=":",
+            color="#fbbf24",
+            label=(
+                f"3x 單倉滾倉 [壓力測試·含分級強平/流動性上限] "
+                f"($1,000 → ${port['eq_comp']:,.0f}, 盤中MDD {port['mdd']:.1f}%, 強平{port['liquidated_3x']}次)"
+            ),
+        )
     ax1.set_yscale("log")
-    step1 = max(1, (len(x_eq) + 12) // 13)
-    ticks1 = list(range(0, len(x_eq), step1))
-    if (len(x_eq) - 1) not in ticks1:
-        ticks1.append(len(x_eq) - 1)
-    ax1.set_xticks(ticks1)
-    ax1.set_xticklabels([port["labels"][idx] for idx in ticks1], fontsize=8, color="#cbd5e1")
     ax1.set_ylabel("帳戶淨值 (USDT, 對數刻度)", color="#cbd5e1")
     ax1.set_title(
-        f"Squeeze × VWAP 護盤雙模狙擊 v2 — {days} 天全市場實戰資金曲線 ({n_syms} 檔合約 / 已扣 0.12% 費滑)",
+        f"Squeeze × VWAP 護盤雙模狙擊 — {days} 天誠實資金曲線 ({n_syms} 檔合約 / 已扣 {base_cost_pct:.2f}% 費滑 + 資金費率)",
         fontsize=12.5,
         fontweight="bold",
         color="#f8fafc",
         pad=10,
     )
     ax1.grid(True, linestyle="--", alpha=0.22, color="#475569")
-    ax1.legend(loc="upper left", fontsize=9.2, facecolor="#1e293b", edgecolor="#334155", labelcolor="#f8fafc")
+    ax1.legend(loc="upper left", fontsize=9.0, facecolor="#1e293b", edgecolor="#334155", labelcolor="#f8fafc")
 
     # 下半部：全訊號 1x 報酬柱狀圖
     x_tr = np.arange(len(ordered))
@@ -540,6 +650,33 @@ def render_trade_cards(
         tr.card_rel_path = f"cards/{fname}"
 
 
+def _to_portfolio_inputs(trades: Sequence[SimTrade]) -> List[bt_utils.PortfolioTradeInput]:
+    return [
+        bt_utils.PortfolioTradeInput(
+            symbol=t.symbol,
+            entry_time=t.entry_time,
+            exit_time=t.exit_time_trend,
+            entry_price=t.entry_price,
+            stop_price=t.stop_price,
+            exit_price=t.exit_price_trend,
+            risk_pct=t.risk_pct,
+            net_pnl_pct=t.pnl_trend,
+            r_mult=t.r_trend,
+            worst_low_price=t.worst_low_price if t.worst_low_price > 0 else min(t.entry_price, t.exit_price_trend),
+            bar_quote_vol_usd=t.bar_quote_vol_usd,
+            trailing_24h_qv_usd=t.trailing_24h_qv_usd,
+            funding_cost_pct=t.funding_cost_pct,
+            roundtrip_cost_pct=t.roundtrip_cost_pct,
+            priority=float(t.score) * 1000.0 + float(t.qv_mult),
+            mtm_times_ms=t.mtm_times_ms,
+            mtm_trough_prices=t.mtm_trough_prices,
+            mtm_close_prices=t.mtm_close_prices,
+            payload=t,
+        )
+        for t in trades
+    ]
+
+
 def write_html_report(
     trades: Sequence[SimTrade],
     port: Dict[str, Any],
@@ -547,6 +684,9 @@ def write_html_report(
     days: int,
     n_syms: int,
     eq_filename: str = "equity_curve_180d.png",
+    oos_report: Optional[Dict[str, Any]] = None,
+    sens_rows: Optional[Sequence[Dict[str, Any]]] = None,
+    base_cost_pct: float = FEE_ROUNDTRIP_PCT,
 ) -> Path:
     m1_list = [t for t in trades if t.mode == "VWAP_COIL_BREAK"]
     m2_list = [t for t in trades if t.mode == "ULTRA_SQUEEZE_CLIMAX"]
@@ -565,9 +705,14 @@ def write_html_report(
         is_m2 = t.mode == "ULTRA_SQUEEZE_CLIMAX"
         tag_bg = "#d97706" if is_m2 else "#059669"
         tag_lbl = "★ M2 · 極致窒息核爆" if is_m2 else "★ M1 · VWAP護盤突破"
+        oos_badge = " [OOS]" if t.is_oos else " [IS]"
         pnl_bg = "#00c853" if t.pnl_trend > 0 else "#dc2626"
         ex_pair = exec_map.get((t.symbol, t.entry_time))
-        bal_str = f" ｜ 滾倉餘額 <b>${ex_pair[1]:,.0f}</b>" if ex_pair else " ｜ <i>(與前單重疊略過)</i>"
+        bal_str = (
+            f" ｜ {port['risk_pct_per_trade']:g}%定倉後淨值 <b>${ex_pair[1]:,.0f}</b>"
+            if ex_pair
+            else " ｜ <i>(滿倉重疊略過)</i>"
+        )
         img_block = (
             f'<a href="{escape(t.card_rel_path)}" target="_blank">'
             f'<img src="{escape(t.card_rel_path)}" loading="lazy" alt="{escape(t.symbol)}"/></a>'
@@ -580,16 +725,16 @@ def write_html_report(
               <div class="card-header">
                 <div>
                   <span class="sym">{escape(t.symbol)}</span>
-                  <span class="tag" style="background:{tag_bg};color:#fff;">{tag_lbl}</span>
+                  <span class="tag" style="background:{tag_bg};color:#fff;">{tag_lbl}{oos_badge}</span>
                   <span class="time">{t.entry_time.strftime('%Y-%m-%d %H:%M')} TPE</span>
                 </div>
                 <div class="pnl-badge" style="background:{pnl_bg}">
-                  1x: {t.pnl_trend:+.1f}% ｜ 3x: {t.pnl_trend * 3:+.1f}% ({t.r_trend:+.2f}R)
+                  1x淨利: {t.pnl_trend:+.1f}% ({t.r_trend:+.2f}R)
                 </div>
               </div>
               <div class="card-meta">
                 進場: <b>{t.entry_price:.6g}</b> ｜ 初始止損: <b>{t.stop_price:.6g}</b> (風險 {t.risk_pct:.1f}%) ｜
-                出場: <b>{t.exit_price_trend:.6g}</b> ({escape(t.exit_reason_trend)}){bal_str}
+                出場: <b>{t.exit_price_trend:.6g}</b> ({escape(t.exit_reason_trend)}) ｜ 資金費率: <b>{t.funding_cost_pct:+.2f}%</b>{bal_str}
               </div>
               <div class="card-note">{escape(t.note)}</div>
               {img_block}
@@ -601,14 +746,16 @@ def write_html_report(
     for t in sorted(trades, key=lambda x: x.entry_time, reverse=True):
         cls = "pos" if t.pnl_trend > 0 else "neg"
         m_short = "M2 極致核爆" if t.mode == "ULTRA_SQUEEZE_CLIMAX" else "M1 護盤突破"
+        split_lbl = "OOS" if t.is_oos else "IS"
         rows_html.append(
             f"<tr><td>{t.entry_time.strftime('%Y-%m-%d %H:%M')}</td>"
             f"<td><b>{escape(t.symbol)}</b></td>"
+            f"<td>{split_lbl}</td>"
             f"<td>{m_short}</td>"
             f"<td>{t.entry_price:.6g}</td><td>{t.stop_price:.6g} (-{t.risk_pct:.1f}%)</td>"
             f"<td>{t.bbw_min10_pct:.1f}%~{t.bbw_max24_pct:.1f}%</td>"
             f"<td>{t.qv_mult:.1f}x</td><td>{t.taker_buy_pct:.1f}%</td>"
-            f"<td>+{t.max_fav_pct:.1f}%</td>"
+            f"<td>{t.funding_cost_pct:+.2f}%</td>"
             f"<td class='{cls}'>{t.pnl_trend:+.2f}% ({t.r_trend:+.2f}R)</td>"
             f"<td>{t.pnl_fixed3r:+.2f}%</td>"
             f"<td>{escape(t.exit_reason_trend)}</td></tr>"
@@ -616,6 +763,13 @@ def write_html_report(
 
     m1_top = "、".join(f"{t.symbol.replace('USDT','')} ({t.pnl_trend:+.0f}%)" for t in sorted(m1_list, key=lambda x: x.pnl_trend, reverse=True)[:4]) or "-"
     m2_top = "、".join(f"{t.symbol.replace('USDT','')} ({t.pnl_trend:+.0f}%)" for t in sorted(m2_list, key=lambda x: x.pnl_trend, reverse=True)[:4]) or "-"
+    risk_pct_lbl = float(port.get("risk_pct_per_trade", 2.0))
+    oos_section_html = bt_utils.render_oos_walkforward_html(oos_report, risk_pct=risk_pct_lbl) if oos_report else ""
+    sens_section_html = (
+        bt_utils.render_cost_sensitivity_html(sens_rows, base_cost_pct=base_cost_pct, risk_pct=risk_pct_lbl)
+        if sens_rows
+        else ""
+    )
 
     html = f"""<!doctype html>
 <html lang="zh-Hant">
@@ -657,39 +811,42 @@ def write_html_report(
 </head>
 <body>
 <div class="container">
-  <h1>🎯 Squeeze × VWAP 護盤 × 主動買盤｜雙模狙擊 v2 過去 {days} 天 ({period_label}) 實戰戰報</h1>
+  <h1>🎯 Squeeze × VWAP 護盤 × 主動買盤｜雙模狙擊 過去 {days} 天 ({period_label}) 誠實回測報告</h1>
   <div class="sub">
-    K線週期：<b>15m</b> ｜ 掃描標的池：<b>{n_syms} 檔幣安 USDT 永續合約（完全獨立腳本 · 0% 依賴均線腳本）</b> ｜
-    出場策略：<b>+0.6R 移保本(+0.3%) + 抗回踩後跌破 BB 中軌止盈</b>（已扣雙邊手續費與滑價 {FEE_ROUNDTRIP_PCT:.2f}%）
+    時點滾動成交額標的池：<b>{n_syms} 檔幣安 USDT 永續合約（無強制塞幣、無未來成交額前視、含歷史下架合約）</b> ｜
+    出場策略：<b>+{BREAKEVEN_ARM_R:.2f}R 移保本(+{BREAKEVEN_BUFFER_PCT:.2f}%，同根保守檢查低點，跳空 min(open, stop) 成交) + 跌破 BB 中軌止盈</b>（已扣雙邊費滑 {base_cost_pct:.2f}% 與資金費率）
   </div>
 
   <div class="kpis">
+    <div class="kpi"><div class="label">★ 主指標：{port['risk_pct_per_trade']:g}% 以損定倉複利</div><div class="val green">${port['eq_risk2']:,.0f} ({port['risk2_ret_pct']:+.1f}%)</div></div>
+    <div class="kpi"><div class="label">{port['risk_pct_per_trade']:g}% 定倉盤中 MTM MDD (最多{port['max_positions']}倉)</div><div class="val">{port['mdd_risk2']:.1f}%</div></div>
+    <div class="kpi"><div class="label">1x 真實無槓桿複利淨值</div><div class="val green">${port['eq_spot_1x']:,.0f} ({port['spot_1x_ret_pct']:+.1f}%)</div></div>
     <div class="kpi"><div class="label">雙模總訊號 / 勝率</div><div class="val green">{st_all['win_rate']:.1f}% ({st_all['wins']}/{st_all['n']})</div></div>
-    <div class="kpi"><div class="label">1x 累計實戰淨利</div><div class="val green">{st_all['sum_pnl']:+.1f}%</div></div>
-    <div class="kpi"><div class="label">累計盈虧比 / 獲利因子</div><div class="val amber">{st_all['sum_r']:+.1f}R · PF {st_all['pf']:.2f}</div></div>
-    <div class="kpi"><div class="label">3x 全倉滾倉 / MDD</div><div class="val green">${port['eq_comp']:,.0f} ({port['mdd']:.1f}%)</div></div>
-    <div class="kpi"><div class="label">2% 以損定倉複利 / MDD</div><div class="val green">${port['eq_risk2']:,.0f} ({port['mdd_risk2']:.1f}%)</div></div>
-    <div class="kpi"><div class="label">固定 3x 不滾倉最終資金</div><div class="val">${port['eq_fixed']:,.2f}</div></div>
-    <div class="kpi"><div class="label">最大連虧次數</div><div class="val amber">{st_all['max_loss_streak']} 次</div></div>
+    <div class="kpi"><div class="label">累計盈虧比 / 獲利因子</div><div class="val amber">{st_all['sum_r']:+.1f}R · PF {escape(bt_utils.fmt_pf(st_all['pf']))}</div></div>
+    <div class="kpi"><div class="label">單筆報酬算術總和 (非複利)</div><div class="val">{st_all['sum_pnl']:+.1f}%</div></div>
+    <div class="kpi"><div class="label">3x 滾倉壓力測試 (含強平/流動性上限)</div><div class="val amber">${port['eq_comp']:,.0f} ({port['mdd']:.1f}%)</div></div>
   </div>
 
-  <h2>⚡ 雙模分項表現對照（極致提純去噪後表現）</h2>
+  {oos_section_html}
+  {sens_section_html}
+
+  <h2>⚡ 雙模分項表現對照（已扣手續費、滑價與歷史/保守資金費率）</h2>
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
-          <th>子雷達名稱</th><th>核心形態與過濾機制</th><th>交易筆數</th><th>實戰勝率</th><th>1x 累計報酬</th><th>平均單筆</th><th>累積 R / PF</th><th>代表大魚</th>
+          <th>子雷達名稱</th><th>核心形態與過濾機制</th><th>交易筆數</th><th>實戰勝率</th><th>單筆算術總和(非複利)</th><th>平均單筆</th><th>累積 R / PF</th><th>代表標的</th>
         </tr>
       </thead>
       <tbody>
         <tr>
           <td><b>★ M1 · VWAP 護盤蓄勢突破</b></td>
-          <td>連8根站穩VWAP + 24h箱體&le;9% + 中期斜率向上 + Donchian突破 + 6x放量加速</td>
+          <td>連站12h VWAP + 窄箱體壓縮 + 中期斜率向上 + Donchian突破 + 6x放量加速</td>
           <td><b>{st_m1['n']} 筆</b> ({st_m1['wins']}勝)</td>
           <td class="pos">{st_m1['win_rate']:.1f}%</td>
           <td class="pos">{st_m1['sum_pnl']:+.1f}%</td>
           <td>{st_m1['avg_pnl']:+.1f}%</td>
-          <td>{st_m1['sum_r']:+.1f}R / {st_m1['pf']:.1f}</td>
+          <td>{st_m1['sum_r']:+.1f}R / {escape(bt_utils.fmt_pf(st_m1['pf']))}</td>
           <td>{escape(m1_top)}</td>
         </tr>
         <tr>
@@ -699,18 +856,18 @@ def write_html_report(
           <td class="pos">{st_m2['win_rate']:.1f}%</td>
           <td class="pos">{st_m2['sum_pnl']:+.1f}%</td>
           <td>{st_m2['avg_pnl']:+.1f}%</td>
-          <td>{st_m2['sum_r']:+.1f}R / {st_m2['pf']:.1f}</td>
+          <td>{st_m2['sum_r']:+.1f}R / {escape(bt_utils.fmt_pf(st_m2['pf']))}</td>
           <td>{escape(m2_top)}</td>
         </tr>
         <tr style="background:#0f172a;">
           <td><b>🚀 雙模合體總計</b></td>
-          <td>單倉排他滾倉執行 {port['executed_count']} 筆（持倉重疊略過 {port['skipped_count']} 筆），最大連虧僅 {st_all['max_loss_streak']} 筆</td>
+          <td>{port['risk_pct_per_trade']:g}% 定倉執行 {port['executed_count']} 筆（滿倉略過 {port['skipped_count']} 筆）｜3x 壓力測試觸發流動性上限 {port['liq_capped_3x']} 次、強平 {port['liquidated_3x']} 次</td>
           <td><b>{st_all['n']} 筆</b> ({st_all['wins']}勝)</td>
           <td class="pos">{st_all['win_rate']:.1f}%</td>
           <td class="pos">{st_all['sum_pnl']:+.1f}%</td>
           <td>{st_all['avg_pnl']:+.1f}%</td>
-          <td class="pos">{st_all['sum_r']:+.1f}R / {st_all['pf']:.2f}</td>
-          <td>滾倉 3x 淨值 <b>${port['eq_comp']:,.0f}</b></td>
+          <td class="pos">{st_all['sum_r']:+.1f}R / {escape(bt_utils.fmt_pf(st_all['pf']))}</td>
+          <td>主指標 {port['risk_pct_per_trade']:g}%定倉 <b>${port['eq_risk2']:,.0f}</b></td>
         </tr>
       </tbody>
     </table>
@@ -730,8 +887,8 @@ def write_html_report(
     <table>
       <thead>
         <tr>
-          <th>進場時間 (TPE)</th><th>幣種</th><th>模式</th><th>進場價</th><th>止損 (風險)</th>
-          <th>壓縮BBW</th><th>成交額倍數</th><th>主動買盤</th><th>後續最高</th>
+          <th>進場時間 (TPE)</th><th>幣種</th><th>區間</th><th>模式</th><th>進場價</th><th>止損 (風險)</th>
+          <th>壓縮BBW</th><th>成交額倍數</th><th>主動買盤</th><th>資金費率成本</th>
           <th>趨勢追蹤淨利</th><th>對照固定3R</th><th>出場原因</th>
         </tr>
       </thead>
@@ -748,101 +905,282 @@ def write_html_report(
 
 
 def main() -> int:
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError) as exc:
+            logger.debug("stdout UTF-8 reconfigure skipped: %s", exc)
 
-    parser = argparse.ArgumentParser(description="Squeeze 雙模狙擊雷達 v2 — 180 天 (6個月) 全市場回測")
+    parser = argparse.ArgumentParser(description="Squeeze 雙模狙擊雷達 v2 — 全市場無偏誤回測")
     parser.add_argument("--interval", type=str, default="15m")
     parser.add_argument("--days", type=int, default=180)
-    parser.add_argument("--top", type=int, default=80, help="掃描幣種數，預設 80 檔 (另自動包含 EVAAUSDT)")
-    parser.add_argument("--min-vol", type=float, default=2_000_000)
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--out-dir", type=str, default="")
-    parser.add_argument("--cache-dir", type=str, default="")
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=0,
+        help="訊號當下前 24h 滾動成交額排名前 N 過濾 (0=全部符合 min-vol 標的，不按字母截斷)",
+    )
+    parser.add_argument("--min-vol", type=float, default=2_000_000, help="訊號當下前 24h 最低滾動成交額 USDT (預設 2000000)")
+    parser.add_argument("--workers", type=int, default=4, help="載入執行緒數 (預設 4)")
+    parser.add_argument("--risk-pct", type=float, default=2.0, help="主指標單筆風險佔總權益百分比 (預設 2.0)")
+    parser.add_argument("--max-positions", type=int, default=3, help="最大同時持倉數 (預設 3)")
+    parser.add_argument(
+        "--max-bar-vol-pct",
+        type=float,
+        default=0.02,
+        help="單筆倉位名目金額佔突破 K 線成交額上限比例 (預設 0.02 = 2%%)",
+    )
+    parser.add_argument("--no-liquidity-cap", action="store_true", help="停用倉位流動性上限")
+    parser.add_argument("--breakeven-r", type=float, default=BREAKEVEN_ARM_R, help=f"觸發保本止損所需浮盈 R 倍數 (預設 {BREAKEVEN_ARM_R})")
+    parser.add_argument(
+        "--breakeven-buffer-pct",
+        type=float,
+        default=BREAKEVEN_BUFFER_PCT,
+        help=f"保本止損高於進場價之緩衝 %% (預設 {BREAKEVEN_BUFFER_PCT})",
+    )
+    parser.add_argument(
+        "--max-hold-bars",
+        type=int,
+        default=0,
+        help="最長持有 K 線根數 (0=按 K 線時長自動換算 40h，15m 下為 160 根)",
+    )
+    parser.add_argument(
+        "--fee-pct",
+        "--roundtrip-cost-pct",
+        dest="fee_pct",
+        type=float,
+        default=FEE_ROUNDTRIP_PCT,
+        help=f"雙邊手續費+滑價總成本 %% (預設 {FEE_ROUNDTRIP_PCT}%%；報告同時輸出 0.12%%/0.30%%/0.50%% 敏感度對照)",
+    )
+    parser.add_argument(
+        "--sensitivity-costs",
+        type=str,
+        default="0.12,0.30,0.50",
+        help="成本敏感度測試之雙邊費滑 %% 清單，逗號分隔 (預設 0.12,0.30,0.50)",
+    )
+    parser.add_argument(
+        "--funding-rate-8h",
+        type=float,
+        default=0.03,
+        help="無法抓取歷史費率時每 8h 結算之保守估計資金費率 %% (預設 0.03)",
+    )
+    parser.add_argument("--no-fetch-funding", action="store_true", help="不連網抓取歷史資金費率，直接使用保守估計值")
+    parser.add_argument("--oos-date", type=str, default="", help="樣本外盲測切分日期 YYYY-MM-DD (預設依 --oos-ratio 自動切分)")
+    parser.add_argument("--oos-ratio", type=float, default=0.30, help="樣本外盲測時間佔比 (預設 0.30 = 後 30%% 為 OOS)")
+    parser.add_argument("--wf-folds", type=int, default=4, help="Walk-Forward 時間切片期數 (預設 4)")
+    parser.add_argument("--skip-cards", action="store_true", help="略過單筆復盤圖卡繪製以加速驗證")
+    parser.add_argument("--out-dir", type=str, default="", help="輸出資料夾路徑")
+    parser.add_argument("--cache-dir", type=str, default=os.environ.get("BINANCE_CACHE_DIR", ""), help="K線快取資料夾 (環境變數 BINANCE_CACHE_DIR)")
+    parser.add_argument("--npz-dir", type=str, default=os.environ.get("BINANCE_NPZ_DIR", ""), help="NPZ快取資料夾 (環境變數 BINANCE_NPZ_DIR)")
+    radar.add_radar_threshold_args(parser)
     args = parser.parse_args()
+    radar_cfg = radar.radar_config_from_args(args)
 
     out_dir = Path(args.out_dir) if args.out_dir else Path(f"breakout_output/backtest_{args.days}d_squeeze")
     cache_dir = Path(args.cache_dir) if args.cache_dir else Path(f"breakout_output/cache_{args.days}d")
+    npz_dir = Path(args.npz_dir) if args.npz_dir else None
 
-    cached_365 = sorted(Path("breakout_output/cache_365d").glob(f"*_{args.interval}_365d.pkl"))
-    if len(cached_365) >= args.top:
-        syms = [f.name.split(f"_{args.interval}_")[0] for f in cached_365[: args.top]]
+    cached_frames = bt_utils.load_cached_frames(
+        [cache_dir, npz_dir, Path("breakout_output/cache_365d"), Path("breakout_output/cache_180d")],
+        interval=args.interval,
+        excluded_symbols=radar.BLACKLIST,
+    )
+    now_dt = datetime.now(TPE)
+    start_dt = now_dt - timedelta(days=args.days)
+    if cached_frames:
+        syms = sorted(cached_frames.keys())
     else:
-        syms = radar.list_usdt_perps(min_quote_vol_usd=args.min_vol, max_symbols=args.top)
-    if "EVAAUSDT" not in syms:
-        syms.append("EVAAUSDT")
+        syms = bt_utils.list_historical_usdt_perps(
+            radar.HTTP,
+            start_ms=int(start_dt.timestamp() * 1000),
+            end_ms=int(now_dt.timestamp() * 1000),
+            excluded_symbols=radar.BLACKLIST,
+            base_url=radar.BINANCE_FAPI,
+        )
 
-    print(f"開始執行 v2 雙模狙擊 {args.days} 天 ({args.interval}) 全市場回測：共 {len(syms)} 檔合約...")
+    print(f"開始執行雙模狙擊 {args.days} 天 ({args.interval}) 全市場無偏誤回測：候選池共 {len(syms)} 檔合約...")
     t0 = time.time()
 
-    all_trades: List[SimTrade] = []
-    dfs_with_hits: Dict[str, pd.DataFrame] = {}
+    tf_win = radar.timeframe_windows(args.interval)
+    bar_ms = tf_win["bar_ms"]
+    bars_per_day = max(1, int(86_400_000 // bar_ms))
+    need = args.days * bars_per_day + tf_win["min_df_len"]
+    eff_max_hold_bars = args.max_hold_bars if args.max_hold_bars > 0 else tf_win["max_hold_bars"]
+
+    all_dfs: Dict[str, pd.DataFrame] = {}
     dfs_lock = threading.Lock()
     done_cnt = 0
 
-    def _worker(sym: str) -> List[SimTrade]:
-        df = fetch_klines_180d(sym, interval=args.interval, days=args.days, cache_dir=cache_dir)
-        if df.empty:
-            return []
-        hits = radar.scan_squeeze_breakouts(df, sym, interval=args.interval, sniper_only=True)
-        out: List[SimTrade] = []
-        for h in hits:
-            tr = simulate_trade(df, h)
-            if tr is not None:
-                out.append(tr)
-        if out:
-            with dfs_lock:
-                dfs_with_hits[sym] = df
-        return out
+    def _load_one(sym: str) -> Optional[pd.DataFrame]:
+        if sym in cached_frames:
+            raw_c = cached_frames[sym]
+            sub = raw_c.iloc[-need:] if len(raw_c) > need else raw_c
+            return compute_indicators(sub, interval=args.interval)
+        return fetch_klines_180d(sym, interval=args.interval, days=args.days, cache_dir=cache_dir)
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(_worker, s): s for s in syms}
+        futs = {ex.submit(_load_one, s): s for s in syms}
         for fut in as_completed(futs):
+            sym = futs[fut]
             done_cnt += 1
-            res = fut.result()
-            if res:
-                all_trades.extend(res)
-            if done_cnt % 20 == 0 or done_cnt == len(syms):
-                print(f"  進度: {done_cnt}/{len(syms)} 檔 ({time.time() - t0:.1f}s)｜精選命中: {len(all_trades)} 筆")
+            df = fut.result()
+            if df is not None and not df.empty:
+                with dfs_lock:
+                    all_dfs[sym] = df
+            if done_cnt % 40 == 0 or done_cnt == len(syms):
+                print(f"  載入進度: {done_cnt}/{len(syms)} 檔 ({time.time() - t0:.1f}s)")
+
+    if not all_dfs:
+        print("無有效歷史 K 線資料可供回測。")
+        return 0
+
+    pit_index = bt_utils.PointInTimeVolumeIndex(all_dfs)
+    funding_store = bt_utils.FundingRateStore(
+        cache_dir=cache_dir,
+        fallback_rate_8h_pct=args.funding_rate_8h,
+        fetch_online=not args.no_fetch_funding,
+        session=radar.HTTP,
+        base_url=radar.BINANCE_FAPI,
+    )
+    all_trades: List[SimTrade] = []
+    dfs_with_hits: Dict[str, pd.DataFrame] = {}
+    min_ts = min(df.index[0] for df in all_dfs.values())
+    max_ts = max(df.index[-1] for df in all_dfs.values())
+    eval_start = max(min_ts.to_pydatetime(), max_ts.to_pydatetime() - timedelta(days=args.days))
+
+    for sym, df in sorted(all_dfs.items()):
+        hits = radar.scan_squeeze_breakouts(df, sym, interval=args.interval, sniper_only=True, config=radar_cfg)
+        sym_trades: List[SimTrade] = []
+        for h in hits:
+            if h.timestamp < eval_start:
+                continue
+            ok_vol, qv24, _ = pit_index.check_eligibility(
+                sym, h.timestamp, min_quote_vol=args.min_vol, top_n=args.top
+            )
+            if not ok_vol:
+                continue
+            tr = simulate_trade(
+                df,
+                h,
+                max_hold_bars=eff_max_hold_bars,
+                breakeven_arm_r=args.breakeven_r,
+                breakeven_buffer_pct=args.breakeven_buffer_pct,
+                roundtrip_cost_pct=args.fee_pct,
+                funding_store=funding_store,
+                trailing_24h_qv_usd=qv24,
+            )
+            if tr is not None:
+                sym_trades.append(tr)
+        if sym_trades:
+            dfs_with_hits[sym] = df
+            all_trades.extend(sym_trades)
 
     all_trades.sort(key=lambda t: t.entry_time)
     if not all_trades:
         print("回測期間內無符合條件之交易。")
         return 0
 
-    st_all = summarize_trades(all_trades)
-    port = simulate_portfolio_3x(all_trades, initial_cap=1000.0, leverage=3.0)
+    port_inputs = _to_portfolio_inputs(all_trades)
+    oos_report = bt_utils.compute_oos_and_walkforward(
+        port_inputs,
+        window_start=eval_start,
+        window_end=max_ts.to_pydatetime(),
+        oos_split_date=args.oos_date,
+        oos_ratio=args.oos_ratio,
+        wf_folds=args.wf_folds,
+        initial_cap=1000.0,
+        risk_pct_per_trade=args.risk_pct,
+        max_positions=args.max_positions,
+    )
+    sens_levels = [float(x.strip()) for x in args.sensitivity_costs.split(",") if x.strip()]
+    if round(args.fee_pct, 4) not in [round(x, 4) for x in sens_levels]:
+        sens_levels = sorted(sens_levels + [args.fee_pct])
+    sens_rows = bt_utils.compute_cost_sensitivity(
+        port_inputs,
+        cost_levels_pct=sens_levels,
+        initial_cap=1000.0,
+        risk_pct_per_trade=args.risk_pct,
+        max_positions=args.max_positions,
+        apply_liquidity_cap=not args.no_liquidity_cap,
+        max_bar_vol_share=args.max_bar_vol_pct,
+    )
+    split_ts = oos_report["split_ts"]
+    for t in all_trades:
+        t.is_oos = pd.Timestamp(t.entry_time) >= split_ts
 
-    print("\n" + "=" * 105)
-    print(f"🎯 Squeeze × VWAP 護盤雙模狙擊 v2｜{args.days} 天回測總結 ({len(syms)} 檔｜共 {st_all['n']} 筆｜已扣 {FEE_ROUNDTRIP_PCT:.2f}% 費滑)")
+    st_all = summarize_trades(all_trades)
+    port = simulate_portfolio_3x(
+        all_trades,
+        initial_cap=1000.0,
+        leverage=3.0,
+        risk_pct_per_trade=args.risk_pct,
+        max_positions=args.max_positions,
+        apply_liquidity_cap=not args.no_liquidity_cap,
+        max_bar_vol_share=args.max_bar_vol_pct,
+    )
+    ins_st = oos_report["in_sample"]
+    oos_st = oos_report["out_of_sample"]
+
+    print("\n" + "=" * 108)
+    print(
+        f"🎯 Squeeze × VWAP 護盤雙模狙擊｜{args.days} 天誠實回測總結 "
+        f"({len(all_dfs)} 檔｜共 {st_all['n']} 筆｜已扣 {args.fee_pct:.2f}% 費滑 + 資金費率)"
+    )
+    print("-" * 108)
+    print(
+        f"  ★ 主指標 ({args.risk_pct:g}% 以損定倉複利, 最多{args.max_positions}倉): "
+        f"${port['eq_risk2']:,.2f} ({port['risk2_ret_pct']:+,.1f}%) | 盤中MTM MDD: {port['mdd_risk2']:.1f}% "
+        f"(執行 {port['executed_count']} 筆 / 滿倉略過 {port['skipped_count']} 筆)\n"
+        f"  1x 真實無槓桿複利                            : ${port['eq_spot_1x']:,.2f} ({port['spot_1x_ret_pct']:+,.1f}%) | "
+        f"盤中MTM MDD: {port['mdd_spot_1x']:.1f}% | 單筆算術總和(非複利): {st_all['sum_pnl']:+.1f}%\n"
+        f"  3x 單倉滾倉 [壓力測試·含分級強平/流動性上限] : ${port['eq_comp']:,.2f} ({port['comp_ret_pct']:+,.1f}%) | "
+        f"盤中MTM MDD: {port['mdd']:.1f}% | 流動性受限 {port['liq_capped_3x']} 次 | 強平 {port['liquidated_3x']} 次"
+    )
+    print(
+        f"  整體勝率: {st_all['win_rate']:.1f}% ({st_all['wins']}/{st_all['n']}) | "
+        f"累積 R: {st_all['sum_r']:+.1f}R | PF: {bt_utils.fmt_pf(st_all['pf'])} | 最大連虧: {st_all['max_loss_streak']} 次\n"
+        f"  [IS 樣本內 < {oos_report['split_str'][:10]}] {ins_st['n']} 筆 | 勝率 {ins_st['win_rate']:.1f}% | "
+        f"總R {ins_st['sum_r']:+.1f}R | PF {bt_utils.fmt_pf(ins_st['pf'])} | {args.risk_pct:g}%定倉 ${ins_st['risk_eq']:,.0f}\n"
+        f"  [OOS 樣本外 >= {oos_report['split_str'][:10]}] {oos_st['n']} 筆 | 勝率 {oos_st['win_rate']:.1f}% | "
+        f"總R {oos_st['sum_r']:+.1f}R | PF {bt_utils.fmt_pf(oos_st['pf'])} | {args.risk_pct:g}%定倉 ${oos_st['risk_eq']:,.0f}"
+    )
     print("-" * 105)
-    print(
-        f"  勝率: {st_all['win_rate']:.1f}% ({st_all['wins']}/{st_all['n']}) | "
-        f"1x 累計淨利: {st_all['sum_pnl']:+.1f}% | 累積 R: {st_all['sum_r']:+.1f}R | PF: {st_all['pf']:.2f} | "
-        f"最大連虧: {st_all['max_loss_streak']} 次"
-    )
-    print(
-        f"  3x 全倉滾倉 ($1,000 起): ${port['eq_comp']:,.2f} ({port['comp_ret_pct']:+,.1f}%) | MDD: {port['mdd']:.1f}%\n"
-        f"  2% 以損定倉安全複利    : ${port['eq_risk2']:,.2f} ({port['risk2_ret_pct']:+,.1f}%) | MDD: {port['mdd_risk2']:.1f}%\n"
-        f"  固定 3x 單利           : ${port['eq_fixed']:,.2f} (執行 {port['executed_count']} 筆 / 重疊略過 {port['skipped_count']} 筆)"
-    )
+    print("💸 成本敏感度對照 (雙邊手續費+滑價 + 資金費率)：")
+    for srow in sens_rows:
+        cst = srow["stats"]
+        print(
+            f"  費滑 {srow['cost_pct']:.2f}% | 勝率 {cst['win_rate']:5.1f}% ({cst['wins']}/{cst['n']}) | "
+            f"平均 {cst['avg_r']:+.2f}R / 總 {cst['sum_r']:+.1f}R | PF {bt_utils.fmt_pf(cst['pf'])} | "
+            f"2%定倉 ${cst['risk_eq']:,.2f} ({cst['risk_ret_pct']:+.1f}%, MTM MDD -{cst['risk_mdd_pct']:.1f}%) | "
+            f"1x複利 ${cst['spot_eq']:,.2f}"
+        )
     print("-" * 105)
     print("📋 全數交易明細：")
     for t in all_trades:
         m_tag = "M2" if t.mode == "ULTRA_SQUEEZE_CLIMAX" else "M1"
+        split_tag = "OOS" if t.is_oos else "IS "
         print(
-            f"  {t.entry_time.strftime('%Y-%m-%d %H:%M')} | {t.symbol:<12} | {m_tag} | 進:{t.entry_price:<9.5g} | "
-            f"1x:{t.pnl_trend:+6.1f}% ({t.r_trend:+5.2f}R) | 最高:+{t.max_fav_pct:5.1f}% | {t.exit_reason_trend}"
+            f"  {t.entry_time.strftime('%Y-%m-%d %H:%M')} | {split_tag} | {t.symbol:<12} | {m_tag} | 進:{t.entry_price:<9.5g} | "
+            f"1x:{t.pnl_trend:+6.1f}% ({t.r_trend:+5.2f}R, 費率:{t.funding_cost_pct:+.2f}%) | 最高:+{t.max_fav_pct:5.1f}% | {t.exit_reason_trend}"
         )
     print("=" * 105)
 
     eq_filename = f"equity_curve_{args.days}d.png"
     out_dir.mkdir(parents=True, exist_ok=True)
-    render_trade_cards(all_trades, dfs_with_hits, out_dir / "cards")
-    plot_equity_curves(all_trades, port, out_dir / eq_filename, args.days, len(syms))
-    report = write_html_report(all_trades, port, out_dir, args.days, len(syms), eq_filename=eq_filename)
+    if not args.skip_cards:
+        render_trade_cards(all_trades, dfs_with_hits, out_dir / "cards")
+    plot_equity_curves(all_trades, port, out_dir / eq_filename, args.days, len(all_dfs), base_cost_pct=args.fee_pct)
+    report = write_html_report(
+        all_trades,
+        port,
+        out_dir,
+        args.days,
+        len(all_dfs),
+        eq_filename=eq_filename,
+        oos_report=oos_report,
+        sens_rows=sens_rows,
+        base_cost_pct=args.fee_pct,
+    )
     print(f"\n[圖表與報告已產出] {report.resolve()}")
     return 0
 

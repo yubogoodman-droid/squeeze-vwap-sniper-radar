@@ -569,7 +569,7 @@ def main() -> int:
         pass
 
     parser = argparse.ArgumentParser(description="幣安永續合約「Squeeze × VWAP護盤 × 主動買盤」雙模狙擊起漲雷達 v2")
-    parser.add_argument("--symbols", type=str, default="", help="指定幣種測試，逗號分隔 (例如 EVAAUSDT,SHELLUSDT)")
+    parser.add_argument("--symbols", type=str, default="", help="指定幣種測試，逗號分隔 (例如 BTCUSDT,SOLUSDT)")
     parser.add_argument("--interval", type=str, default="15m", help="K 線週期 (5m, 15m, 1h)，預設 15m")
     parser.add_argument("--limit", type=int, default=560, help="拉取 K 線根數，預設 560")
     parser.add_argument("--scan", action="store_true", help="執行單次全市場掃描")

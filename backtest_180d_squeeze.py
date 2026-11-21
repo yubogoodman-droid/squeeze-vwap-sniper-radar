@@ -16,8 +16,9 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
+import os
 from pathlib import Path
 import sys
 import threading
@@ -31,6 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+import backtest_utils as bt_utils
 import squeeze_breakout_radar as radar
 
 TPE = ZoneInfo("Asia/Taipei")
@@ -93,21 +95,24 @@ def fetch_klines_180d(
     need = days * bars_per_day + 260
 
     if cache_dir is not None:
-        cache_file = cache_dir / f"{symbol}_{interval}_{days}d.pkl"
-        if cache_file.exists():
-            try:
-                cached = pd.read_pickle(cache_file)
-                if isinstance(cached, pd.DataFrame) and not cached.empty:
-                    return compute_indicators(cached.astype(float), interval=interval)
-            except Exception:
-                pass
-        # 若查詢天數 <= 365 且已有 365d 快取，直接從 365d 快取切片免重抓與免佔雙倍硬碟空間
+        for candidate in (
+            cache_dir / f"{symbol}_{interval}_{days}d.pkl",
+            cache_dir / f"{symbol}_{interval}_365d.pkl" if days <= 365 else None,
+        ):
+            if candidate is not None and candidate.exists():
+                try:
+                    cached = bt_utils.normalize_kline_df(pd.read_pickle(candidate))
+                    if not cached.empty:
+                        sub = cached.iloc[-need:] if len(cached) > need else cached
+                        return compute_indicators(sub, interval=interval)
+                except Exception:
+                    pass
         alt_365 = Path("breakout_output/cache_365d") / f"{symbol}_{interval}_365d.pkl"
         if days <= 365 and alt_365.exists():
             try:
-                c365 = pd.read_pickle(alt_365)
-                if isinstance(c365, pd.DataFrame) and not c365.empty:
-                    sub = c365.iloc[-need:].astype(float) if len(c365) > need else c365.astype(float)
+                c365 = bt_utils.normalize_kline_df(pd.read_pickle(alt_365))
+                if not c365.empty:
+                    sub = c365.iloc[-need:] if len(c365) > need else c365
                     return compute_indicators(sub, interval=interval)
             except Exception:
                 pass
@@ -753,59 +758,102 @@ def main() -> int:
     except Exception:
         pass
 
-    parser = argparse.ArgumentParser(description="Squeeze 雙模狙擊雷達 v2 — 180 天 (6個月) 全市場回測")
+    parser = argparse.ArgumentParser(description="Squeeze 雙模狙擊雷達 v2 — 全市場無偏誤回測")
     parser.add_argument("--interval", type=str, default="15m")
     parser.add_argument("--days", type=int, default=180)
-    parser.add_argument("--top", type=int, default=80, help="掃描幣種數，預設 80 檔 (另自動包含 EVAAUSDT)")
-    parser.add_argument("--min-vol", type=float, default=2_000_000)
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=0,
+        help="訊號當下前 24h 滾動成交額排名前 N 過濾 (0=全部符合 min-vol 標的，不按字母截斷)",
+    )
+    parser.add_argument("--min-vol", type=float, default=2_000_000, help="訊號當下前 24h 最低滾動成交額 (USDT)")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--out-dir", type=str, default="")
-    parser.add_argument("--cache-dir", type=str, default="")
+    parser.add_argument("--cache-dir", type=str, default=os.environ.get("BINANCE_CACHE_DIR", ""))
+    parser.add_argument("--npz-dir", type=str, default=os.environ.get("BINANCE_NPZ_DIR", ""))
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir) if args.out_dir else Path(f"breakout_output/backtest_{args.days}d_squeeze")
     cache_dir = Path(args.cache_dir) if args.cache_dir else Path(f"breakout_output/cache_{args.days}d")
+    npz_dir = Path(args.npz_dir) if args.npz_dir else None
 
-    cached_365 = sorted(Path("breakout_output/cache_365d").glob(f"*_{args.interval}_365d.pkl"))
-    if len(cached_365) >= args.top:
-        syms = [f.name.split(f"_{args.interval}_")[0] for f in cached_365[: args.top]]
+    cached_frames = bt_utils.load_cached_frames(
+        [cache_dir, npz_dir, Path("breakout_output/cache_365d"), Path("breakout_output/cache_180d")],
+        interval=args.interval,
+        excluded_symbols=radar.BLACKLIST,
+    )
+    now_dt = datetime.now(TPE)
+    start_dt = now_dt - timedelta(days=args.days)
+    if cached_frames:
+        syms = sorted(cached_frames.keys())
     else:
-        syms = radar.list_usdt_perps(min_quote_vol_usd=args.min_vol, max_symbols=args.top)
-    if "EVAAUSDT" not in syms:
-        syms.append("EVAAUSDT")
+        syms = bt_utils.list_historical_usdt_perps(
+            radar.HTTP,
+            start_ms=int(start_dt.timestamp() * 1000),
+            end_ms=int(now_dt.timestamp() * 1000),
+            excluded_symbols=radar.BLACKLIST,
+            base_url=radar.BINANCE_FAPI,
+        )
 
-    print(f"開始執行 v2 雙模狙擊 {args.days} 天 ({args.interval}) 全市場回測：共 {len(syms)} 檔合約...")
+    print(f"開始執行雙模狙擊 {args.days} 天 ({args.interval}) 全市場無偏誤回測：候選池共 {len(syms)} 檔合約...")
     t0 = time.time()
 
-    all_trades: List[SimTrade] = []
-    dfs_with_hits: Dict[str, pd.DataFrame] = {}
+    bar_ms = radar.INTERVAL_MS.get(args.interval, 900_000)
+    bars_per_day = max(1, int(86_400_000 // bar_ms))
+    need = args.days * bars_per_day + 260
+
+    all_dfs: Dict[str, pd.DataFrame] = {}
     dfs_lock = threading.Lock()
     done_cnt = 0
 
-    def _worker(sym: str) -> List[SimTrade]:
-        df = fetch_klines_180d(sym, interval=args.interval, days=args.days, cache_dir=cache_dir)
-        if df.empty:
-            return []
-        hits = radar.scan_squeeze_breakouts(df, sym, interval=args.interval, sniper_only=True)
-        out: List[SimTrade] = []
-        for h in hits:
-            tr = simulate_trade(df, h)
-            if tr is not None:
-                out.append(tr)
-        if out:
-            with dfs_lock:
-                dfs_with_hits[sym] = df
-        return out
+    def _load_one(sym: str) -> Optional[pd.DataFrame]:
+        if sym in cached_frames:
+            raw_c = cached_frames[sym]
+            sub = raw_c.iloc[-need:] if len(raw_c) > need else raw_c
+            return compute_indicators(sub, interval=args.interval)
+        return fetch_klines_180d(sym, interval=args.interval, days=args.days, cache_dir=cache_dir)
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(_worker, s): s for s in syms}
+        futs = {ex.submit(_load_one, s): s for s in syms}
         for fut in as_completed(futs):
+            sym = futs[fut]
             done_cnt += 1
-            res = fut.result()
-            if res:
-                all_trades.extend(res)
-            if done_cnt % 20 == 0 or done_cnt == len(syms):
-                print(f"  進度: {done_cnt}/{len(syms)} 檔 ({time.time() - t0:.1f}s)｜精選命中: {len(all_trades)} 筆")
+            df = fut.result()
+            if df is not None and not df.empty:
+                with dfs_lock:
+                    all_dfs[sym] = df
+            if done_cnt % 40 == 0 or done_cnt == len(syms):
+                print(f"  載入進度: {done_cnt}/{len(syms)} 檔 ({time.time() - t0:.1f}s)")
+
+    if not all_dfs:
+        print("無有效歷史 K 線資料可供回測。")
+        return 0
+
+    pit_index = bt_utils.PointInTimeVolumeIndex(all_dfs)
+    all_trades: List[SimTrade] = []
+    dfs_with_hits: Dict[str, pd.DataFrame] = {}
+    min_ts = min(df.index[0] for df in all_dfs.values())
+    max_ts = max(df.index[-1] for df in all_dfs.values())
+    eval_start = max(min_ts.to_pydatetime(), max_ts.to_pydatetime() - timedelta(days=args.days))
+
+    for sym, df in sorted(all_dfs.items()):
+        hits = radar.scan_squeeze_breakouts(df, sym, interval=args.interval, sniper_only=True)
+        sym_trades: List[SimTrade] = []
+        for h in hits:
+            if h.timestamp < eval_start:
+                continue
+            ok_vol, _qv24, _ = pit_index.check_eligibility(
+                sym, h.timestamp, min_quote_vol=args.min_vol, top_n=args.top
+            )
+            if not ok_vol:
+                continue
+            tr = simulate_trade(df, h)
+            if tr is not None:
+                sym_trades.append(tr)
+        if sym_trades:
+            dfs_with_hits[sym] = df
+            all_trades.extend(sym_trades)
 
     all_trades.sort(key=lambda t: t.entry_time)
     if not all_trades:
@@ -816,7 +864,7 @@ def main() -> int:
     port = simulate_portfolio_3x(all_trades, initial_cap=1000.0, leverage=3.0)
 
     print("\n" + "=" * 105)
-    print(f"🎯 Squeeze × VWAP 護盤雙模狙擊 v2｜{args.days} 天回測總結 ({len(syms)} 檔｜共 {st_all['n']} 筆｜已扣 {FEE_ROUNDTRIP_PCT:.2f}% 費滑)")
+    print(f"🎯 Squeeze × VWAP 護盤雙模狙擊 v2｜{args.days} 天回測總結 ({len(all_dfs)} 檔｜共 {st_all['n']} 筆｜已扣 {FEE_ROUNDTRIP_PCT:.2f}% 費滑)")
     print("-" * 105)
     print(
         f"  勝率: {st_all['win_rate']:.1f}% ({st_all['wins']}/{st_all['n']}) | "
@@ -841,8 +889,8 @@ def main() -> int:
     eq_filename = f"equity_curve_{args.days}d.png"
     out_dir.mkdir(parents=True, exist_ok=True)
     render_trade_cards(all_trades, dfs_with_hits, out_dir / "cards")
-    plot_equity_curves(all_trades, port, out_dir / eq_filename, args.days, len(syms))
-    report = write_html_report(all_trades, port, out_dir, args.days, len(syms), eq_filename=eq_filename)
+    plot_equity_curves(all_trades, port, out_dir / eq_filename, args.days, len(all_dfs))
+    report = write_html_report(all_trades, port, out_dir, args.days, len(all_dfs), eq_filename=eq_filename)
     print(f"\n[圖表與報告已產出] {report.resolve()}")
     return 0
 

@@ -138,12 +138,12 @@
 <div class="app">
   <header>
     <div class="top-row">
-      <h1>🎯 幣安起漲點狙擊雷達 v3</h1>
-      <span class="pill">一年 97.6% 勝率</span>
+      <h1>🎯 幣安起漲點狙擊雷達</h1>
+      <span class="pill">僅掃已收盤K · 純訊號無下單</span>
     </div>
     <div class="tabs">
       <button class="tab-btn active" id="tabRadar" onclick="switchTab('radar')">即時雙模掃描</button>
-      <button class="tab-btn" id="tabBt" onclick="switchTab('bt')">1年戰績 (PF 368)</button>
+      <button class="tab-btn" id="tabBt" onclick="switchTab('bt')">歷史回測看板</button>
     </div>
   </header>
 
@@ -154,15 +154,15 @@
         <div class="field">
           <label>偵測策略版本</label>
           <select id="presetSelect">
-            <option value="sniper" selected>⚡ 雙模狙擊實戰 (一年勝率97.6% · 半年100%)</option>
+            <option value="sniper" selected>⚡ 雙模狙擊實戰版 (M1 護盤突破 + M2 窒息核爆)</option>
             <option value="relaxed">🔍 寬鬆預警版 (所有初階壓縮突破)</option>
           </select>
         </div>
         <div class="field">
           <label>K 線週期</label>
           <select id="intervalSelect">
-            <option value="5m">5 分鐘 (極早搶跑)</option>
-            <option value="15m" selected>15 分鐘 (實戰主力)</option>
+            <option value="5m">5 分鐘 (短線格局)</option>
+            <option value="15m" selected>15 分鐘 (預設主力)</option>
             <option value="1h">1 小時 (波段大格局)</option>
           </select>
         </div>
@@ -170,19 +170,24 @@
           <label>掃描幣種數量 (24h 成交額排序)</label>
           <select id="topNSelect">
             <option value="80">前 80 檔 (最快 ~4秒)</option>
-            <option value="180" selected>前 180 檔 (含中小妖幣)</option>
+            <option value="180" selected>前 180 檔 (主流與中型標的)</option>
             <option value="250">前 250 檔 (全市場覆蓋)</option>
           </select>
         </div>
         <div class="field">
-          <label>回看近幾根 K 線</label>
+          <label>回看近幾根已收盤 K 線</label>
           <select id="recentSelect">
-            <option value="6">最近 6 根 (約 1.5 小時)</option>
-            <option value="12" selected>最近 12 根 (約 3 小時)</option>
-            <option value="24">最近 24 根 (約 6 小時)</option>
+            <option value="6">最近 6 根</option>
+            <option value="12" selected>最近 12 根</option>
+            <option value="24">最近 24 根</option>
           </select>
         </div>
       </div>
+
+      <label style="display:flex;align-items:center;gap:6px;margin-top:9px;font-size:12px;color:var(--muted);cursor:pointer;">
+        <input type="checkbox" id="includeFormingToggle" />
+        納入當根未收盤 K 線（等同 <code>--include-forming</code>，盤中可能重繪；預設關閉僅掃已收盤 K 線）
+      </label>
 
       <div class="btn-row">
         <button class="primary" id="btnScan" onclick="startScan()">⚡ 立即全市場掃描</button>
@@ -190,7 +195,7 @@
       </div>
 
       <div class="single-row">
-        <input type="text" id="singleSym" placeholder="查指定幣種回顧，例如 EVAAUSDT 或 SHELLUSDT" autocapitalize="characters" />
+        <input type="text" id="singleSym" placeholder="查指定幣種回顧，例如 BTCUSDT 或 SOLUSDT" autocapitalize="characters" />
         <button onclick="scanSingleSymbol()">查單幣</button>
       </div>
 
@@ -205,45 +210,29 @@
 
     <div id="resultsArea">
       <div class="empty">
-        已升級為 <b>v3 全年去噪雙模狙擊引擎（1 年勝率 97.6% / PF 367.82；近半年 27 戰全勝 100%）</b>：<br>
-        • <b>M1 VWAP 護盤突破</b>：連 8 根站穩 12h VWAP + 排除 2.0%~3.7% 無力溫吞漂移帶 + 蓄勢期買盤承接 + 6x 放量加速<br>
-        • <b>M2 極致窒息核爆</b>：6h 布林帶寬 ≤ 2.2% 極度窒息後單根 ≥ 30x 巨量實體噴發（一年 5 戰 5 勝 100%）<br><br>
-        點上方 <b>「⚡ 立即全市場掃描」</b>，或輸入 <b>EVAAUSDT</b> 按「查單幣」看它點火的標準形態！
+        <b>Squeeze × VWAP 護盤 × 主動買盤雙模雷達（預設僅掃描已收盤 K 線避免重繪）</b>：<br>
+        • <b>M1 VWAP 護盤突破</b>：起漲前連站 12h VWAP + 窄箱體壓縮 + 中期均線翻揚 + 6x 放量加速突破 24h 高點<br>
+        • <b>M2 極致窒息核爆</b>：6h 布林帶寬 ≤ 2.2% 且振幅 ≤ 3.0% 極度窒息後單根 ≥ 30x 巨量實體突破<br><br>
+        點上方 <b>「⚡ 立即全市場掃描」</b>，或輸入任一合約代號（如 <b>BTCUSDT</b>）按「查單幣」檢視歷史訊號。
       </div>
     </div>
   </section>
 
-  <!-- 1年與半年回測戰績分頁 -->
+  <!-- 歷史回測看板分頁 -->
   <section id="viewBt" class="hidden">
     <div class="panel">
-      <h2 style="margin:0 0 6px;font-size:16px;">📅 365 天 (1 年) 80 檔全市場實戰總結</h2>
-      <p style="margin:0;font-size:12px;color:var(--muted);line-height:1.55;">
-        2025-11 ~ 2026-11 完整一年 · 已扣 <b>0.12%</b> 費滑 · <b>+0.55R 保本鎖定 + 跌破 BB 中軌止盈</b>
+      <h2 style="margin:0 0 6px;font-size:16px;">📅 365 天 / 180 天歷史回測看板入口</h2>
+      <p style="margin:0;font-size:12px;color:var(--muted);line-height:1.6;">
+        純訊號研究工具（無下單、無 API Key）。本機執行 <code>backtest_180d_squeeze.py</code> 可依據時點滾動 24h 成交額標的池、歷史/保守資金費率、費滑敏感度（0.12% / 0.30% / 0.50%）、2% 以損定倉併發主指標與 IS/OOS 盲測重新產出下方靜態報表。
       </p>
-      <div class="bt-stat">
-        <div class="m-box"><div class="m-lbl">1 年總勝率 / 筆數</div><div class="m-val pos">97.6% (40/41)</div><div class="sub-time">PF 367.82 · 最大連虧 1 次</div></div>
-        <div class="m-box"><div class="m-lbl">1x 累計淨利 / 累積 R</div><div class="m-val pos">+529.0%</div><div class="sub-time">+70.7R · 平均單筆 +12.9%</div></div>
-        <div class="m-box"><div class="m-lbl">2% 以損定倉安全複利</div><div class="m-val green">$3,596 (+260%)</div><div class="sub-time">MDD 僅 <b>-0.6%</b> · 實戰推薦風控</div></div>
-        <div class="m-box"><div class="m-lbl">3x 全倉滾倉 / MDD</div><div class="m-val gold">$22,904,804</div><div class="sub-time">3x 滾倉 MDD 僅 <b>-4.3%</b></div></div>
-      </div>
 
       <a href="./breakout_output/backtest_365d_squeeze/equity_curve_365d.png" target="_blank">
         <img class="eq-preview" src="./breakout_output/backtest_365d_squeeze/equity_curve_365d.png" loading="lazy" alt="365d Equity Curve" />
       </a>
 
       <div class="card-actions" style="grid-template-columns:1fr;margin-top:12px;">
-        <a class="act-btn bn" href="./breakout_output/backtest_365d_squeeze/index.html">📈 開啟完整 1 年 (41 筆) 復盤圖卡與明細報告</a>
-      </div>
-    </div>
-
-    <div class="panel">
-      <h2 style="margin:0 0 6px;font-size:16px;">🎯 180 天 (近半年) 80 檔實戰對照</h2>
-      <div class="bt-stat">
-        <div class="m-box"><div class="m-lbl">近半年總勝率 / 筆數</div><div class="m-val pos">100.0% (27/27)</div><div class="sub-time">27 戰全勝 · 最大連虧 0 次</div></div>
-        <div class="m-box"><div class="m-lbl">1x 累計 / 2%以損定倉</div><div class="m-val pos">+449.8% (+59R)</div><div class="sub-time">2%定倉 $2,862 (MDD 0.0%)</div></div>
-      </div>
-      <div class="card-actions" style="grid-template-columns:1fr;margin-top:12px;">
-        <a class="act-btn" href="./breakout_output/backtest_180d_squeeze/index.html">📊 開啟近半年 (27 筆) 獨立戰報</a>
+        <a class="act-btn bn" href="./breakout_output/backtest_365d_squeeze/index.html">📈 開啟 365 天回測圖卡與明細報告</a>
+        <a class="act-btn" href="./breakout_output/backtest_180d_squeeze/index.html">📊 開啟 180 天回測圖卡與明細報告</a>
       </div>
     </div>
 
@@ -334,6 +323,19 @@ let watchCountdown = 0;
 let seenKeys = new Set();
 let isScanning = false;
 
+(function initFormingOption() {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get("include_forming") === "1" || params.get("include_forming") === "true") {
+    const el = document.getElementById("includeFormingToggle");
+    if (el) el.checked = true;
+  }
+})();
+
+function shouldDropForming() {
+  const el = document.getElementById("includeFormingToggle");
+  return !(el && el.checked);
+}
+
 function switchTab(name) {
   document.getElementById("viewRadar").classList.toggle("hidden", name !== "radar");
   document.getElementById("viewBt").classList.toggle("hidden", name !== "bt");
@@ -390,8 +392,14 @@ function rollingMean(arr, win, minP) {
   return out;
 }
 
-function analyzeSymbol(raw, symbol, interval, preset, recentBars) {
-  if (!Array.isArray(raw) || raw.length < 260) return [];
+function analyzeSymbol(raw, symbol, interval, preset, recentBars, dropForming = true) {
+  if (!Array.isArray(raw)) return [];
+  const barMs = IV_MS[interval] || 900000;
+  const nowMs = Date.now();
+  while (dropForming && raw.length && Number(raw[raw.length - 1][0]) + barMs > nowMs) {
+    raw = raw.slice(0, -1);
+  }
+  if (raw.length < 260) return [];
   const n = raw.length;
   const ts = raw.map(x => Number(x[0]));
   const o = raw.map(x => parseFloat(x[1]));
@@ -557,8 +565,9 @@ function analyzeSymbol(raw, symbol, interval, preset, recentBars) {
     const sClv = Math.max(0, Math.min(20, ((clv - 0.65) / 0.35) * 20));
     const score = Math.min(99, Math.round(sSq + sVol + sTbr + sClv + ((isM1 || isM2) ? 8 : 0)));
 
-    const maxFutureH = Math.max(...h.slice(i));
-    const maxAfter = ((maxFutureH - c[i]) / c[i]) * 100;
+    const futureHighs = h.slice(i + 1);
+    const maxFutureH = futureHighs.length ? Math.max(...futureHighs) : c[i];
+    const maxAfter = Math.max(0, ((maxFutureH - c[i]) / c[i]) * 100);
     const note = isM2
       ? `⚡M2 極致窒息：6h帶寬≤${bMax24.toFixed(1)}% · 振幅${rng24.toFixed(1)}% → ${qvMult[i].toFixed(1)}x巨量 · 實體${(clv*100).toFixed(0)}%`
       : `★M1 護盤突破：連${abvVwap8}根站穩VWAP · 24h箱體${rng96.toFixed(1)}% · 放量加速${volAccel.toFixed(1)}x`;
@@ -697,7 +706,7 @@ function drawMiniChart(canvas, cd) {
 function renderHits(hits) {
   const area = document.getElementById("resultsArea");
   if (!hits.length) {
-    area.innerHTML = `<div class="empty">目前時間窗口內沒有符合 <b>v2 雙模狙擊（90.5%勝率）</b> 的極品起漲點。<br>狙擊版極度寧缺勿濫（半年全市場精選約 20 筆），想先看初階預警可切換「🔍 寬鬆預警版」或開啟 60 秒自動盯盤。</div>`;
+    area.innerHTML = `<div class="empty">目前時間窗口內沒有符合 <b>雙模狙擊（僅掃已收盤 K 線）</b> 條件的突破訊號。<br>狙擊版過濾條件較嚴格，若想觀察初階壓縮突破可切換「🔍 寬鬆預警版」或開啟 60 秒自動盯盤。</div>`;
     return;
   }
   area.innerHTML = "";
@@ -742,12 +751,12 @@ function renderHits(hits) {
 }
 
 function copySetup(sym, entry, stop) {
-  const txt = `${sym} v2雙模起漲｜進場參考: ${entry}｜初始止損: ${stop} (+0.6R移保本, 破BB中軌止盈)`;
+  const txt = `${sym} 雙模起漲訊號｜進場參考: ${entry}｜初始止損: ${stop} (+0.55R移保本, 破BB中軌止盈)`;
   if (navigator.clipboard) navigator.clipboard.writeText(txt).catch(() => {});
   alert("已複製：\n" + txt);
 }
 
-async function runBatch(symbols, interval, preset, recentBars) {
+async function runBatch(symbols, interval, preset, recentBars, dropForming = true) {
   const progWrap = document.getElementById("progWrap");
   const progFill = document.getElementById("progFill");
   const statusText = document.getElementById("statusText");
@@ -758,12 +767,13 @@ async function runBatch(symbols, interval, preset, recentBars) {
   let done = 0;
   const hits = [];
   const queue = [...symbols];
+  const reqLimit = dropForming ? 561 : 560;
   const workers = Array.from({ length: Math.min(8, queue.length) }, async () => {
     while (queue.length) {
       const sym = queue.shift();
       try {
-        const raw = await fetch(`${FAPI}/fapi/v1/klines?symbol=${sym}&interval=${interval}&limit=560`).then(r => r.json());
-        const res = analyzeSymbol(raw, sym, interval, preset, recentBars);
+        const raw = await fetch(`${FAPI}/fapi/v1/klines?symbol=${sym}&interval=${interval}&limit=${reqLimit}`).then(r => r.json());
+        const res = analyzeSymbol(raw, sym, interval, preset, recentBars, dropForming);
         if (res.length) hits.push(...res);
       } catch (e) {}
       done++;
@@ -799,7 +809,8 @@ async function startScan() {
     document.getElementById("statusText").textContent = "正在取得幣安流動性清單...";
     const syms = await fetchUniverse(topN);
     const beforeCount = seenKeys.size;
-    const hits = await runBatch(syms, interval, preset, recentBars);
+    const dropForming = shouldDropForming();
+    const hits = await runBatch(syms, interval, preset, recentBars, dropForming);
     const hasNew = hits.some(h => !seenKeys.has(`${h.symbol}_${h.timeMs}`));
     renderHits(hits);
     if (watchTimer && beforeCount > 0 && hasNew) playBeep();
@@ -818,7 +829,7 @@ async function scanSingleSymbol() {
   try {
     const preset = document.getElementById("presetSelect").value;
     const interval = document.getElementById("intervalSelect").value;
-    const hits = await runBatch([sym], interval, preset, 0);
+    const hits = await runBatch([sym], interval, preset, 0, shouldDropForming());
     renderHits(hits);
   } finally {
     isScanning = false;

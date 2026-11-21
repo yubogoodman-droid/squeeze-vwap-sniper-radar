@@ -161,9 +161,23 @@ def compute_radar_indicators(df: pd.DataFrame, interval: str = "15m") -> pd.Data
     return df
 
 
-def load_klines_with_orderflow(symbol: str, interval: str = "15m", limit: int = 560) -> pd.DataFrame:
-    raw = api_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": min(1500, limit)})
-    if not raw or len(raw) < 260:
+def load_klines_with_orderflow(
+    symbol: str,
+    interval: str = "15m",
+    limit: int = 560,
+    drop_forming: bool = True,
+) -> pd.DataFrame:
+    bar_ms = INTERVAL_MS.get(interval, 900_000)
+    req_limit = min(1500, limit + (1 if drop_forming else 0))
+    raw = api_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": req_limit})
+    if not raw:
+        return pd.DataFrame()
+
+    now_ms = int(time.time() * 1000)
+    while drop_forming and raw and int(raw[-1][0]) + bar_ms > now_ms:
+        raw = raw[:-1]
+
+    if len(raw) < 260:
         return pd.DataFrame()
 
     df = pd.DataFrame(
@@ -299,8 +313,8 @@ def scan_squeeze_breakouts(
         if risk <= 0 or (risk / c[i] * 100.0) < 0.8 or (risk / c[i] * 100.0) > 14.0:
             continue
 
-        future_high = float(np.max(h[i:]))
-        max_gain_after = (future_high - c[i]) / c[i] * 100.0
+        future_high = float(np.max(h[i + 1 :])) if (i + 1) < len(h) else float(c[i])
+        max_gain_after = max(0.0, (future_high - c[i]) / c[i] * 100.0)
 
         s_sq = max(0.0, min(25.0, (7.0 - b_min10) / 7.0 * 25.0))
         s_vol = max(0.0, min(30.0, min(qvm[i], 30.0) / 30.0 * 30.0))
@@ -493,12 +507,13 @@ def run_radar(
     limit: int = 560,
     sniper_only: bool = True,
     plot_dir: Optional[Path] = None,
+    drop_forming: bool = True,
 ) -> List[RadarHit]:
     hits: List[RadarHit] = []
 
     def _scan_one(sym: str) -> List[RadarHit]:
         try:
-            df = load_klines_with_orderflow(sym, interval=interval, limit=limit)
+            df = load_klines_with_orderflow(sym, interval=interval, limit=limit, drop_forming=drop_forming)
             res = scan_squeeze_breakouts(df, sym, interval=interval, sniper_only=sniper_only)
             if not res:
                 return []
@@ -564,11 +579,13 @@ def main() -> int:
     parser.add_argument("--max-symbols", type=int, default=260, help="最多掃描幣種數，預設 260")
     parser.add_argument("--recent-bars", type=int, default=10, help="掃描模式顯示最近 N 根內的新起漲訊號")
     parser.add_argument("--plot", action="store_true", help="輸出深色主題三合一雷達圖 PNG")
+    parser.add_argument("--include-forming", action="store_true", help="納入尚未收盤的當根 K 線（預設僅掃描已收盤 K 線避免重繪）")
     parser.add_argument("--out-dir", type=str, default="breakout_output", help="圖表輸出資料夾")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     sniper_only = not args.relaxed
+    drop_forming = not args.include_forming
 
     if args.symbols:
         syms = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -580,6 +597,7 @@ def main() -> int:
             limit=args.limit,
             sniper_only=sniper_only,
             plot_dir=out_dir if args.plot else None,
+            drop_forming=drop_forming,
         )
         print_hits(hits)
         if args.plot and hits:
@@ -594,7 +612,7 @@ def main() -> int:
         now_str = datetime.now(TPE).strftime("%Y-%m-%d %H:%M:%S")
         syms = list_usdt_perps(min_quote_vol_usd=args.min_vol, max_symbols=args.max_symbols)
         mode_tag = "雙模狙擊實戰版" if sniper_only else "寬鬆預警版"
-        print(f"\n[{now_str} TPE] 雷達掃描 {len(syms)} 檔 USDT 永續合約 ({args.interval} | {mode_tag})...")
+        print(f"\n[{now_str} TPE] 雷達掃描 {len(syms)} 檔 USDT 永續合約 ({args.interval} | {mode_tag} | 已收盤K={drop_forming})...")
         hits = run_radar(
             syms,
             interval=args.interval,
@@ -602,6 +620,7 @@ def main() -> int:
             limit=args.limit,
             sniper_only=sniper_only,
             plot_dir=out_dir if args.plot else None,
+            drop_forming=drop_forming,
         )
 
         if args.watch > 0:
